@@ -1,0 +1,213 @@
+"""MCP tool surface for Waymo ride management."""
+
+from __future__ import annotations
+
+import threading
+import time
+from typing import Annotated, Any, Literal
+
+from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
+from pydantic import Field
+
+from .client import WaymoClient, WaymoError
+
+mcp = MCPServer(
+    "waymo-rides",
+    instructions=(
+        "Manage Waymo rides. Resolve ambiguous places and get a quote before "
+        "booking. Only call booking or cancellation tools after explicit user "
+        "authorization. Never retry an OUTCOME_UNKNOWN mutation; check status."
+    ),
+)
+
+_client: WaymoClient | None = None
+_client_lock = threading.Lock()
+_quotes: dict[str, tuple[float, dict[str, Any]]] = {}
+_quotes_lock = threading.Lock()
+QUOTE_TTL_SECONDS = 10 * 60
+
+
+def _get_client() -> WaymoClient:
+    global _client
+    with _client_lock:
+        if _client is None:
+            try:
+                _client = WaymoClient.from_environment()
+            except (OSError, ValueError) as exc:
+                raise ToolError(
+                    "Waymo credentials are not configured. Set WAYMO_REFRESH_TOKEN "
+                    "or WAYMO_CREDENTIALS_FILE."
+                ) from exc
+        return _client
+
+
+def _call(function: Any, *args: Any, **kwargs: Any) -> Any:
+    try:
+        return function(*args, **kwargs)
+    except WaymoError as exc:
+        raise ToolError(f"{exc.code}: {exc.detail}") from exc
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@mcp.tool(
+    title="Search Waymo places",
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
+def waymo_search_places(
+    query: Annotated[str, Field(min_length=1, description="Place name or address")],
+    bias_latitude: Annotated[
+        float,
+        Field(ge=-90, le=90, description="Search center latitude"),
+    ] = 37.55,
+    bias_longitude: Annotated[
+        float,
+        Field(ge=-180, le=180, description="Search center longitude"),
+    ] = -122.30,
+    limit: Annotated[int, Field(ge=1, le=10)] = 5,
+) -> dict[str, Any]:
+    """Resolve a place name or address to canonical Waymo locations."""
+    places = _call(
+        _get_client().search_places,
+        query,
+        bias_lat=bias_latitude,
+        bias_lng=bias_longitude,
+        limit=limit,
+    )
+    return {
+        "query": query,
+        "results": [place.public(index) for index, place in enumerate(places)],
+    }
+
+
+@mcp.tool(
+    title="Get Waymo ride history",
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
+def waymo_ride_history(
+    limit: Annotated[int, Field(ge=1, le=100)] = 20,
+) -> dict[str, Any]:
+    """Return recent Waymo trips, including cancelled and completed rides."""
+    return {"trips": _call(_get_client().history, limit)}
+
+
+@mcp.tool(
+    title="Get current Waymo ride status",
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
+def waymo_ride_status() -> dict[str, Any]:
+    """Return the active ride and any terminal trip still cached by Waymo."""
+    return _call(_get_client().status)
+
+
+@mcp.tool(
+    title="List Waymo payment methods",
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True),
+)
+def waymo_list_payment_methods() -> dict[str, Any]:
+    """List safe payment-method labels and IDs accepted by the booking tool."""
+    return {"payment_methods": _call(_get_client().payment_methods)}
+
+
+@mcp.tool(
+    title="Get a Waymo ride quote",
+    annotations=ToolAnnotations(
+        read_only_hint=False,
+        destructive_hint=False,
+        idempotent_hint=False,
+        open_world_hint=True,
+    ),
+)
+def waymo_get_quote(
+    pickup: Annotated[str, Field(min_length=1, description="Pickup name or address")],
+    dropoff: Annotated[
+        str,
+        Field(min_length=1, description="Dropoff name or address"),
+    ],
+    pickup_result_index: Annotated[int, Field(ge=0)] = 0,
+    dropoff_result_index: Annotated[int, Field(ge=0)] = 0,
+    passengers: Annotated[int, Field(ge=1, le=4)] = 1,
+) -> dict[str, Any]:
+    """Resolve both endpoints and create a short-lived Waymo booking proposal."""
+    quote = _call(
+        _get_client().quote,
+        pickup,
+        dropoff,
+        pickup_index=pickup_result_index,
+        dropoff_index=dropoff_result_index,
+        passengers=passengers,
+    )
+    with _quotes_lock:
+        _quotes[quote["proposal_token"]] = (time.monotonic(), quote)
+        _purge_quotes()
+    return quote
+
+
+@mcp.tool(
+    title="Book a Waymo ride",
+    annotations=ToolAnnotations(
+        read_only_hint=False,
+        destructive_hint=True,
+        idempotent_hint=False,
+        open_world_hint=True,
+    ),
+)
+def waymo_book_ride(
+    proposal_token: Annotated[
+        str,
+        Field(min_length=1, description="Token returned by waymo_get_quote"),
+    ],
+    payment_method_id: Annotated[
+        str,
+        Field(min_length=1, description="ID returned by waymo_list_payment_methods"),
+    ],
+    confirmation: Literal["BOOK"],
+) -> dict[str, Any]:
+    """Book a quoted ride. Call only after the user explicitly requests booking."""
+    del confirmation
+    with _quotes_lock:
+        record = _quotes.get(proposal_token)
+        if record is None or time.monotonic() - record[0] > QUOTE_TTL_SECONDS:
+            raise ToolError(
+                "Unknown or expired proposal token. Call waymo_get_quote again."
+            )
+    result = _call(_get_client().book, proposal_token, payment_method_id)
+    with _quotes_lock:
+        _quotes.pop(proposal_token, None)
+    return result
+
+
+@mcp.tool(
+    title="Cancel the active Waymo ride",
+    annotations=ToolAnnotations(
+        read_only_hint=False,
+        destructive_hint=True,
+        idempotent_hint=False,
+        open_world_hint=True,
+    ),
+)
+def waymo_cancel_ride(confirmation: Literal["CANCEL"]) -> dict[str, Any]:
+    """Cancel the active ride. Call only after the user explicitly requests it."""
+    del confirmation
+    return _call(_get_client().cancel)
+
+
+def _purge_quotes() -> None:
+    now = time.monotonic()
+    expired = [
+        token
+        for token, (created_at, _quote) in _quotes.items()
+        if now - created_at > QUOTE_TTL_SECONDS
+    ]
+    for token in expired:
+        _quotes.pop(token, None)
+
+
+def main() -> None:
+    mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

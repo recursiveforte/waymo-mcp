@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import time
+import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterator, Sequence
 
@@ -245,6 +247,7 @@ def propose_trip_request(
     passengers: int = 1,
     *,
     intermediate_stops: Sequence[Place] = (),
+    scheduled_option_token: str | None = None,
     plan_template: bytes | None = None,
 ) -> bytes:
     if passengers < 1:
@@ -273,10 +276,11 @@ def propose_trip_request(
         plan = replace_messages(plan_template, {3: configuration})
         plan = replace_repeated_messages(plan, 5, legs)
     else:
-        plan = integer(1, 1) + message(3, passenger)
+        configuration = passenger
+        plan = integer(1, 1) + message(3, configuration)
         for leg in legs:
             plan += message(5, leg)
-    return (
+    request = (
         message(2, plan)
         + integer(3, 1)
         + integer(6, 7)
@@ -284,6 +288,9 @@ def propose_trip_request(
         + integer(8, 0)
         + integer(13, 1)
     )
+    if scheduled_option_token:
+        request += string(10, scheduled_option_token)
+    return request
 
 
 def _money(data: bytes) -> tuple[str, str] | None:
@@ -324,7 +331,67 @@ def parse_quote(response: bytes) -> dict[str, Any]:
     return {
         "proposal_token": token,
         "estimated_fare": f"${estimated_total[1]}" if estimated_total else None,
+        "scheduled_options": [
+            option
+            for raw_option in bytes_fields(offer, 9)
+            if (option := _scheduled_option(raw_option)) is not None
+        ],
     }
+
+
+def _scheduled_option(data: bytes) -> dict[str, Any] | None:
+    tokens = bytes_fields(data, 1)
+    if not tokens:
+        return None
+    token = tokens[0].decode(errors="replace")
+    times = bytes_fields(data, 6)
+    labels = bytes_fields(data, 7)
+    result: dict[str, Any] = {
+        "token": token,
+        "label": times[0].decode(errors="replace") if times else None,
+        "subtitle": labels[0].decode(errors="replace") if labels else None,
+        "is_asap": token == "scheduled_trip_token_asap",
+    }
+    if token.startswith("timestamp_"):
+        try:
+            timestamp = int(token.removeprefix("timestamp_"))
+            result["departure_time"] = datetime.fromtimestamp(
+                timestamp,
+                timezone.utc,
+            ).isoformat()
+        except (ValueError, OverflowError, OSError):
+            pass
+    return result
+
+
+def parse_cancellation_fee(data: bytes) -> str | None:
+    """Extract a structured or rendered USD fee from cancellation preview UX."""
+    pending = [data]
+    seen: set[bytes] = set()
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        money = _money(current)
+        if money:
+            return f"${money[1]}"
+        try:
+            fields = list(iter_fields(current))
+        except ValueError:
+            continue
+        for _field, wire_type, value in fields:
+            if wire_type != 2 or not isinstance(value, bytes):
+                continue
+            try:
+                rendered = value.decode()
+            except UnicodeDecodeError:
+                rendered = ""
+            match = re.search(r"\$\s*\d+(?:\.\d{2})?", rendered)
+            if match:
+                return match.group(0).replace(" ", "")
+            pending.append(value)
+    return None
 
 
 def create_trip_request(proposal_token: str, payment_token: str) -> bytes:

@@ -7,8 +7,10 @@ from waymo_mcp.wire import (
     Place,
     bytes_fields,
     decode,
+    integer,
     lat_lng,
     message,
+    parse_cancellation_fee,
     parse_places,
     parse_quote,
     place_search_request,
@@ -99,6 +101,7 @@ def test_quote_parser_reads_proposal_and_fare() -> None:
     assert quote == {
         "proposal_token": "proposal-123",
         "estimated_fare": "$12.34",
+        "scheduled_options": [],
     }
 
 
@@ -110,12 +113,63 @@ def test_quote_parser_ignores_large_route_payload() -> None:
     assert parse_quote(message(3, offer))["estimated_fare"] == "$12.34"
 
 
+def test_cancellation_fee_parser_reads_nested_money() -> None:
+    fee = string(1, "USD") + string(2, "5.00")
+    assert parse_cancellation_fee(message(2, message(7, fee))) == "$5.00"
+
+
+def test_quote_parser_returns_scheduled_options() -> None:
+    money = string(1, "USD") + string(2, "12.34")
+    pricing = message(3, message(1, money))
+    scheduled = (
+        string(1, "timestamp_1788337500")
+        + string(6, "1:25 AM")
+        + integer(9, 2)
+    )
+    offer = (
+        string(1, "proposal-123")
+        + message(2, pricing)
+        + message(9, scheduled)
+    )
+    options = parse_quote(message(3, offer))["scheduled_options"]
+    assert options == [
+        {
+            "token": "timestamp_1788337500",
+            "label": "1:25 AM",
+            "subtitle": None,
+            "is_asap": False,
+            "departure_time": "2026-09-02T08:25:00+00:00",
+        }
+    ]
+
+
+def test_scheduled_quote_request_places_token_in_verified_field() -> None:
+    request = propose_trip_request(
+        sample_place("Pickup", 37.51, -122.25),
+        sample_place("Dropoff", 37.54, -122.28),
+        scheduled_option_token="timestamp_1788337500",
+    )
+    decoded = decode(request)
+    assert decoded["10"] == b"timestamp_1788337500"
+
+
 def test_active_trip_parser() -> None:
     decoded = {
         "2": {
             "1": b"123",
+            "2": {
+                "1": b"vehicle-7",
+                "2": {"1": 375200000, "2": -1222600000},
+                "3": 182500,
+                "7": {"1": 1788337500},
+                "8": 3,
+                "10": b"ABC123",
+                "18": 15,
+            },
+            "4": {"1": 30},
             "5": {
                 "5": {
+                    "1": 1,
                     "2": {
                         "3": {
                             "1": {"1": 375100000, "2": -1222500000},
@@ -128,7 +182,13 @@ def test_active_trip_parser() -> None:
                             "8": {"1": b"Dropoff", "2": b"Dropoff address"},
                         }
                     },
+                    "4": {"1": {"1": 4000000000}},
                 }
+            },
+            "16": b"https://waymo.example/trip/123",
+            "17": {
+                "1": 1,
+                "4": {"1": 375200000, "2": -1222600000},
             },
         }
     }
@@ -136,6 +196,15 @@ def test_active_trip_parser() -> None:
     assert active is not None
     assert active["pickup"]["name"] == "Pickup"
     assert active["dropoff"]["name"] == "Dropoff"
+    assert active["state"] == "TO_PICKUP"
+    assert active["vehicle"]["license_plate"] == "ABC123"
+    assert active["vehicle"]["position"]["latitude"] == pytest.approx(37.52)
+    assert active["vehicle"]["heading_degrees"] == pytest.approx(182.5)
+    assert active["vehicle"]["speed_mph"] == 15
+    assert active["vehicle"]["type"] == "LIBERTY"
+    assert active["pickup_eta_seconds"] > 0
+    assert active["tracking_url"] == "https://waymo.example/trip/123"
+    assert active["arrival"]["state"] == "DISPATCHED"
 
 
 def test_history_trip_id_normalization() -> None:

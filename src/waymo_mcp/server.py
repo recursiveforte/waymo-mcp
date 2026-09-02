@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
@@ -28,6 +29,9 @@ _client_lock = threading.Lock()
 _quotes: dict[str, tuple[float, dict[str, Any]]] = {}
 _quotes_lock = threading.Lock()
 QUOTE_TTL_SECONDS = 10 * 60
+_cancel_preview: tuple[float, str, str] | None = None
+_cancel_preview_lock = threading.Lock()
+CANCEL_PREVIEW_TTL_SECONDS = 5 * 60
 
 
 def _get_client() -> WaymoClient:
@@ -135,20 +139,51 @@ def waymo_get_quote(
             description="Ordered intermediate stop names or addresses",
         ),
     ] = None,
+    intermediate_stop_result_indices: Annotated[
+        list[int] | None,
+        Field(
+            max_length=3,
+            description=(
+                "Search-result index for each intermediate stop; defaults to 0"
+            ),
+        ),
+    ] = None,
     pickup_result_index: Annotated[int, Field(ge=0)] = 0,
     dropoff_result_index: Annotated[int, Field(ge=0)] = 0,
     passengers: Annotated[int, Field(ge=1, le=4)] = 1,
+    scheduled_option_token: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Token from a prior quote's scheduled_options; omit for ASAP"
+            )
+        ),
+    ] = None,
 ) -> dict[str, Any]:
-    """Resolve the route and create a short-lived Waymo booking proposal."""
+    """Quote an ASAP route, or re-quote using one returned scheduling option."""
     quote = _call(
         _get_client().quote,
         pickup,
         dropoff,
         intermediate_stop_queries=intermediate_stops,
+        intermediate_stop_indices=intermediate_stop_result_indices,
         pickup_index=pickup_result_index,
         dropoff_index=dropoff_result_index,
         passengers=passengers,
+        scheduled_option_token=scheduled_option_token,
     )
+    quote = {
+        **quote,
+        "waymo_expires_at": None,
+        "expiry_note": (
+            "Waymo does not expose an authoritative expiry; re-quote if "
+            "booking reports PROPOSAL_STALE"
+        ),
+        "mcp_cache_ttl_seconds": QUOTE_TTL_SECONDS,
+        "mcp_cache_expires_at": (
+            datetime.now(timezone.utc) + timedelta(seconds=QUOTE_TTL_SECONDS)
+        ).isoformat(),
+    }
     with _quotes_lock:
         _quotes[quote["proposal_token"]] = (time.monotonic(), quote)
         _purge_quotes()
@@ -190,6 +225,34 @@ def waymo_book_ride(
 
 
 @mcp.tool(
+    title="Preview Waymo ride cancellation",
+    annotations=ToolAnnotations(
+        read_only_hint=False,
+        destructive_hint=False,
+        idempotent_hint=False,
+        open_world_hint=True,
+    ),
+)
+def waymo_preview_cancellation() -> dict[str, Any]:
+    """Preview cancellation and its fee without cancelling the active ride."""
+    global _cancel_preview
+    preview = _call(_get_client().preview_cancel)
+    token = preview.pop("_cancellation_token", None)
+    if preview.get("can_cancel") and token:
+        with _cancel_preview_lock:
+            _cancel_preview = (
+                time.monotonic(),
+                preview["trip_id"],
+                token,
+            )
+        preview["preview_expires_at"] = (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=CANCEL_PREVIEW_TTL_SECONDS)
+        ).isoformat()
+    return preview
+
+
+@mcp.tool(
     title="Cancel the active Waymo ride",
     annotations=ToolAnnotations(
         read_only_hint=False,
@@ -199,9 +262,24 @@ def waymo_book_ride(
     ),
 )
 def waymo_cancel_ride(confirmation: Literal["CANCEL"]) -> dict[str, Any]:
-    """Cancel the active ride. Call only after the user explicitly requests it."""
+    """Cancel after a fresh fee preview and explicit user confirmation."""
+    global _cancel_preview
     del confirmation
-    return _call(_get_client().cancel)
+    with _cancel_preview_lock:
+        preview = _cancel_preview
+        if (
+            preview is None
+            or time.monotonic() - preview[0] > CANCEL_PREVIEW_TTL_SECONDS
+        ):
+            _cancel_preview = None
+            raise ToolError(
+                "No fresh cancellation preview. Call "
+                "waymo_preview_cancellation first and show its fee to the user."
+            )
+    result = _call(_get_client().confirm_cancel, preview[2], preview[1])
+    with _cancel_preview_lock:
+        _cancel_preview = None
+    return result
 
 
 def _purge_quotes() -> None:

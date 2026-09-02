@@ -3,14 +3,15 @@
 An unofficial local [Model Context Protocol](https://modelcontextprotocol.io/)
 server for Waymo ride management.
 
-It gives an agent seven tools:
+It gives an agent eight tools:
 
 - Search Waymo places
 - Get ride history
-- Get active ride status
+- Get active ride status, including phase, ETA, vehicle, and arrival data
 - List safe payment-method labels
-- Get a ride quote with up to three intermediate stops
+- Get immediate or scheduled quotes with up to three intermediate stops
 - Book a quoted ride
+- Preview a cancellation and its fee
 - Cancel the active ride
 
 > [!WARNING]
@@ -79,10 +80,15 @@ You can give an agent this repository URL and say:
 ## Safe agent behavior
 
 - Resolve ambiguous places before quoting.
+- Use result indices to select ambiguous pickup, stop, and dropoff matches.
+- For a scheduled ride, quote once to get available times, then quote again
+  with the chosen `scheduled_option_token`.
 - Before booking, check status, list payment methods, and get a fresh quote.
 - Show the canonical pickup, ordered stops, dropoff, and fare before booking.
 - Only pass `confirmation: "BOOK"` after the user explicitly asks to book.
-- Only pass `confirmation: "CANCEL"` after the user explicitly asks to cancel.
+- Before cancellation, call `waymo_preview_cancellation` and show any fee.
+- Only pass `confirmation: "CANCEL"` after the user explicitly confirms that
+  preview.
 - Never retry booking or cancellation after `OUTCOME_UNKNOWN`; check status.
 - Do not print refresh, chauffeur, proposal, or internal payment tokens to the
   user.
@@ -111,6 +117,6 @@ before reporting a vulnerability.
 If you are an agent that just configured this server, confirm the Waymo tools
 are available and send exactly:
 
-> Waymo MCP is online. I can search places, check rides and payment methods,
-> quote routes with up to three intermediate stops, and book or cancel rides
-> when asked.
+> Waymo MCP is online. I can search places, check live ride status, quote and
+> schedule multi-stop rides, preview cancellation fees, and book or cancel
+> rides when asked.

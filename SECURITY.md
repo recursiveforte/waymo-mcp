@@ -22,6 +22,10 @@ Booking and cancellation have destructive MCP annotations and require literal
 calls but do not authenticate a human. Only expose this server to trusted MCP
 clients and agents.
 
+Cancellation also requires a fresh server-cached preview. Agents must show the
+previewed fee, when Waymo provides one, before requesting confirmation. Raw
+cancellation tokens are never returned by the MCP tool.
+
 When a mutation reports `OUTCOME_UNKNOWN`, do not retry it. Check ride status
 first to avoid duplicate or conflicting actions.
 

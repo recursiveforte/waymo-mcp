@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import grpc
@@ -24,6 +25,7 @@ from .wire import (
     cancel_trip_request,
     create_trip_request,
     decode,
+    parse_cancellation_fee,
     parse_places,
     parse_quote,
     place_search_request,
@@ -42,7 +44,48 @@ RPC = {
     "quote": f"{SERVICE}/ProposeTripPlan",
     "book": f"{SERVICE}/CreateTrip",
     "propose_cancel": f"{SERVICE}/ProposeTripCancellation",
+    "cancel_fee_ux": f"{SERVICE}/GetCancellationFeeUx",
     "cancel": f"{SERVICE}/CancelActiveTrip",
+}
+
+TRIP_STATES = {
+    0: "STATE_UNSPECIFIED",
+    10: "REQUESTED",
+    20: "INFEASIBLE",
+    25: "QUEUED",
+    30: "TO_PICKUP",
+    35: "PICKUP_MOVE_ALONG",
+    41: "AT_PICKUP",
+    45: "NO_SHOW",
+    60: "BOARDING",
+    70: "RIDING",
+    80: "STOP_DROPOFF",
+    90: "FINAL_DROPOFF",
+    91: "AT_STOP_ARRIVED",
+    92: "AT_STOP_WAITING",
+    93: "AT_STOP_READY",
+    94: "AT_STOP_VEHICLE_NEARBY",
+    95: "AT_STOP_SUSPENDED",
+    105: "STRANDED",
+    110: "COMPLETED",
+    120: "CANCELLED",
+}
+VEHICLE_TYPES = {
+    0: "VEHICLE_TYPE_UNSPECIFIED",
+    2: "V5",
+    3: "LIBERTY",
+    5: "WAV",
+    6: "AUX",
+    7: "W12",
+    8: "APOLLO",
+}
+ARRIVAL_STATES = {
+    0: "WRA_STATE_UNSPECIFIED",
+    1: "DISPATCHED",
+    2: "ARRIVED",
+    3: "CONTINUING_IN_MANUAL",
+    4: "CANCELLED",
+    5: "INTERRUPTED",
 }
 
 
@@ -59,7 +102,11 @@ class WaymoClient:
         self.credentials = credentials
         self._auth: dict[str, Any] = {}
         self._auth_lock = threading.Lock()
-        self._channel = grpc.secure_channel(HOST, grpc.ssl_channel_credentials())
+        self._channel = grpc.secure_channel(
+            HOST,
+            grpc.ssl_channel_credentials(),
+            options=(("grpc.max_metadata_size", 64 * 1024),),
+        )
         self._payments_cache: tuple[float, list[dict[str, Any]]] | None = None
 
     @classmethod
@@ -209,13 +256,24 @@ class WaymoClient:
         dropoff_query: str,
         *,
         intermediate_stop_queries: list[str] | None = None,
+        intermediate_stop_indices: list[int] | None = None,
         pickup_index: int = 0,
         dropoff_index: int = 0,
         passengers: int = 1,
+        scheduled_option_token: str | None = None,
     ) -> dict[str, Any]:
         intermediate_stop_queries = intermediate_stop_queries or []
+        intermediate_stop_indices = intermediate_stop_indices or [
+            0
+        ] * len(intermediate_stop_queries)
         if len(intermediate_stop_queries) > 3:
             raise ValueError("at most 3 intermediate stops are supported")
+        if len(intermediate_stop_indices) != len(intermediate_stop_queries):
+            raise ValueError(
+                "intermediate_stop_indices must match intermediate_stop_queries"
+            )
+        if any(index < 0 for index in intermediate_stop_indices):
+            raise ValueError("intermediate stop indices cannot be negative")
         ride_state, plan_template = self._status_snapshot()
         if ride_state["active_trip"]:
             raise WaymoError("quote", "ACTIVE_TRIP", "an active trip already exists")
@@ -229,7 +287,10 @@ class WaymoClient:
 
         intermediate_stops: list[Place] = []
         previous = pickup
-        for query in intermediate_stop_queries:
+        for query, result_index in zip(
+            intermediate_stop_queries,
+            intermediate_stop_indices,
+        ):
             results = self.search_places(
                 query,
                 bias_lat=previous.latitude,
@@ -237,7 +298,13 @@ class WaymoClient:
             )
             if not results:
                 raise WaymoError("quote", "STOP_NOT_FOUND", query)
-            previous = results[0]
+            try:
+                previous = results[result_index]
+            except IndexError as exc:
+                raise ValueError(
+                    f"result index for intermediate stop {query!r} is outside "
+                    "the search results"
+                ) from exc
             intermediate_stops.append(previous)
 
         dropoffs = self.search_places(
@@ -259,17 +326,29 @@ class WaymoClient:
                     dropoff,
                     passengers,
                     intermediate_stops=intermediate_stops,
+                    scheduled_option_token=scheduled_option_token,
                     plan_template=plan_template,
                 ),
                 timeout=20,
             )
         )
+        selected_scheduled_option = next(
+            (
+                option
+                for option in result["scheduled_options"]
+                if option["token"] == scheduled_option_token
+            ),
+            None,
+        )
+        if scheduled_option_token and selected_scheduled_option is None:
+            selected_scheduled_option = {"token": scheduled_option_token}
         return {
             **result,
             "pickup": pickup.public(),
             "intermediate_stops": [stop.public() for stop in intermediate_stops],
             "dropoff": dropoff.public(),
             "passengers": passengers,
+            "selected_scheduled_option": selected_scheduled_option,
         }
 
     def book(self, proposal_token: str, payment_method_id: str) -> dict[str, Any]:
@@ -308,10 +387,10 @@ class WaymoClient:
             )
         return {"booked": True, "active_trip": active}
 
-    def cancel(self) -> dict[str, Any]:
+    def preview_cancel(self) -> dict[str, Any]:
         before = self.status()["active_trip"]
         if not before:
-            return {"cancelled": False, "reason": "no_active_trip"}
+            return {"can_cancel": False, "reason": "no_active_trip"}
         proposal = self._unary("propose_cancel")
         tokens = bytes_fields(proposal, 2)
         if not tokens:
@@ -320,10 +399,38 @@ class WaymoClient:
                 "TOKEN_MISSING",
                 "Waymo returned no cancellation token",
             )
+        fee = parse_cancellation_fee(proposal)
+        if fee is None:
+            try:
+                fee = parse_cancellation_fee(self._unary("cancel_fee_ux"))
+            except WaymoError:
+                pass
+        return {
+            "can_cancel": True,
+            "trip_id": before["trip_id"],
+            "cancellation_fee": fee,
+            "fee_available": fee is not None,
+            "_cancellation_token": tokens[0].decode(errors="replace"),
+        }
+
+    def confirm_cancel(
+        self,
+        cancellation_token: str,
+        expected_trip_id: str,
+    ) -> dict[str, Any]:
+        before = self.status()["active_trip"]
+        if not before:
+            return {"cancelled": False, "reason": "no_active_trip"}
+        if before["trip_id"] != expected_trip_id:
+            raise WaymoError(
+                "cancel",
+                "TRIP_CHANGED",
+                "the active trip changed after cancellation preview",
+            )
         try:
             self._unary(
                 "cancel",
-                cancel_trip_request(tokens[0].decode(errors="replace")),
+                cancel_trip_request(cancellation_token),
                 timeout=20,
             )
         except WaymoError as exc:
@@ -437,15 +544,134 @@ def _active_trip(decoded: Any) -> dict[str, Any] | None:
         return None
     plan = trip.get("5", {})
     legs = plan.get("5") if isinstance(plan, dict) else None
-    leg = legs[0] if isinstance(legs, list) and legs else legs
+    if isinstance(legs, list):
+        leg = next(
+            (
+                candidate
+                for candidate in legs
+                if isinstance(candidate, dict) and candidate.get("1")
+            ),
+            legs[0] if legs else {},
+        )
+    else:
+        leg = legs
     if not isinstance(leg, dict):
         leg = {}
-    return {
+    state = trip.get("4", {})
+    state_code = (
+        int(state.get("1", 0))
+        if isinstance(state, dict) and isinstance(state.get("1", 0), int)
+        else 0
+    )
+    result = {
         "trip_id": _normalize_trip_id(trip_id),
+        "state": TRIP_STATES.get(state_code, f"UNKNOWN_{state_code}"),
+        "state_code": state_code,
         "pickup": _location(leg.get("2")),
         "dropoff": _location(leg.get("3")),
-        "tracking_url": text(trip.get("24")) or None,
+        "tracking_url": text(trip.get("16")) or None,
     }
+    pickup_eta = leg.get("4")
+    if isinstance(pickup_eta, dict):
+        eta_timestamp = _timestamp(pickup_eta.get("1"))
+        if eta_timestamp is not None:
+            result["pickup_eta_seconds"] = max(
+                0,
+                round(eta_timestamp - time.time()),
+            )
+            result["pickup_eta_at"] = datetime.fromtimestamp(
+                eta_timestamp,
+                timezone.utc,
+            ).isoformat()
+    vehicle = _vehicle(trip.get("2"))
+    if vehicle:
+        result["vehicle"] = vehicle
+    arrival = _arrival(trip.get("17"))
+    if arrival:
+        result["arrival"] = arrival
+    configurations = plan.get("3") if isinstance(plan, dict) else None
+    scheduled_token = (
+        text(configurations.get("2"))
+        if isinstance(configurations, dict)
+        else ""
+    )
+    if scheduled_token:
+        result["scheduled_option_token"] = scheduled_token
+    return result
+
+
+def _vehicle(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    vehicle_id = text(value.get("1"))
+    license_plate = text(value.get("10"))
+    if not vehicle_id and not license_plate:
+        return None
+    vehicle: dict[str, Any] = {
+        "vehicle_id": vehicle_id or None,
+        "license_plate": license_plate or None,
+    }
+    position = value.get("2")
+    if isinstance(position, dict):
+        try:
+            vehicle["position"] = {
+                "latitude": int(position["1"]) * 1e-7,
+                "longitude": int(position["2"]) * 1e-7,
+            }
+        except (KeyError, TypeError, ValueError):
+            pass
+    heading = value.get("3")
+    if isinstance(heading, int):
+        vehicle["heading_degrees"] = heading / 1000
+    speed = value.get("18")
+    if isinstance(speed, int):
+        vehicle["speed_mph"] = speed
+    vehicle_type = value.get("8")
+    if isinstance(vehicle_type, int):
+        vehicle["type"] = VEHICLE_TYPES.get(
+            vehicle_type,
+            f"UNKNOWN_{vehicle_type}",
+        )
+    reported_at = _timestamp(value.get("7"))
+    if reported_at is not None:
+        vehicle["last_reported_at"] = datetime.fromtimestamp(
+            reported_at,
+            timezone.utc,
+        ).isoformat()
+    return vehicle
+
+
+def _arrival(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    state_code = value.get("1")
+    position = value.get("4")
+    if not isinstance(state_code, int) and not isinstance(position, dict):
+        return None
+    arrival: dict[str, Any] = {}
+    if isinstance(state_code, int):
+        arrival["state"] = ARRIVAL_STATES.get(
+            state_code,
+            f"UNKNOWN_{state_code}",
+        )
+        arrival["state_code"] = state_code
+    if isinstance(position, dict):
+        try:
+            arrival["position"] = {
+                "latitude": int(position["1"]) * 1e-7,
+                "longitude": int(position["2"]) * 1e-7,
+            }
+        except (KeyError, TypeError, ValueError):
+            pass
+    return arrival or None
+
+
+def _timestamp(value: Any) -> float | None:
+    if not isinstance(value, dict) or not isinstance(value.get("1"), int):
+        return None
+    seconds = int(value["1"])
+    nanos = int(value.get("2", 0))
+    return seconds + nanos / 1_000_000_000
 
 
 def _find_hex_token(value: Any) -> str | None:

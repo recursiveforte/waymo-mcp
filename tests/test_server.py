@@ -18,6 +18,7 @@ class FakeWaymoClient:
     def __init__(self) -> None:
         self.book_calls: list[tuple[str, str]] = []
         self.quote_calls: list[dict[str, Any]] = []
+        self.preview_cancel_calls = 0
         self.cancel_calls = 0
 
     def search_places(self, query: str, **_: Any) -> list[Place]:
@@ -48,7 +49,19 @@ class FakeWaymoClient:
         self.book_calls.append((token, payment_id))
         return {"booked": True, "active_trip": {"trip_id": "2"}}
 
-    def cancel(self) -> dict[str, Any]:
+    def preview_cancel(self) -> dict[str, Any]:
+        self.preview_cancel_calls += 1
+        return {
+            "can_cancel": True,
+            "trip_id": "2",
+            "cancellation_fee": "$0.00",
+            "fee_available": True,
+            "_cancellation_token": "cancel-token",
+        }
+
+    def confirm_cancel(self, token: str, trip_id: str) -> dict[str, Any]:
+        assert token == "cancel-token"
+        assert trip_id == "2"
         self.cancel_calls += 1
         return {"cancelled": True, "trip_id": "2"}
 
@@ -58,13 +71,15 @@ def fake_waymo() -> FakeWaymoClient:
     fake = FakeWaymoClient()
     server._client = fake  # type: ignore[assignment]
     server._quotes.clear()
+    server._cancel_preview = None
     yield fake
     server._client = None
     server._quotes.clear()
+    server._cancel_preview = None
 
 
 @pytest.mark.asyncio
-async def test_server_exposes_only_the_seven_core_tools() -> None:
+async def test_server_exposes_only_the_eight_core_tools() -> None:
     async with Client(server.mcp, raise_exceptions=True) as client:
         result = await client.list_tools()
     tools = {tool.name: tool for tool in result.tools}
@@ -75,6 +90,7 @@ async def test_server_exposes_only_the_seven_core_tools() -> None:
         "waymo_list_payment_methods",
         "waymo_get_quote",
         "waymo_book_ride",
+        "waymo_preview_cancellation",
         "waymo_cancel_ride",
     }
     assert tools["waymo_ride_status"].annotations.read_only_hint is True
@@ -114,7 +130,9 @@ async def test_quote_accepts_ordered_intermediate_stops(
             {
                 "pickup": "SFO",
                 "intermediate_stops": ["Stop 1", "Stop 2"],
+                "intermediate_stop_result_indices": [1, 2],
                 "dropoff": "Oracle",
+                "scheduled_option_token": "timestamp_1788337500",
             },
         )
     assert quote.is_error is False
@@ -125,6 +143,14 @@ async def test_quote_accepts_ordered_intermediate_stops(
         "Stop 1",
         "Stop 2",
     ]
+    assert fake_waymo.quote_calls[-1]["intermediate_stop_indices"] == [1, 2]
+    assert (
+        fake_waymo.quote_calls[-1]["scheduled_option_token"]
+        == "timestamp_1788337500"
+    )
+    assert quote.structured_content["waymo_expires_at"] is None
+    assert quote.structured_content["mcp_cache_ttl_seconds"] == 600
+    assert quote.structured_content["mcp_cache_expires_at"]
 
 
 @pytest.mark.asyncio
@@ -149,6 +175,7 @@ async def test_cancel_requires_literal_confirmation(
     fake_waymo: FakeWaymoClient,
 ) -> None:
     async with Client(server.mcp, raise_exceptions=True) as client:
+        preview = await client.call_tool("waymo_preview_cancellation", {})
         rejected = await client.call_tool(
             "waymo_cancel_ride",
             {"confirmation": "yes"},
@@ -158,5 +185,21 @@ async def test_cancel_requires_literal_confirmation(
             {"confirmation": "CANCEL"},
         )
     assert rejected.is_error is True
+    assert preview.structured_content["cancellation_fee"] == "$0.00"
+    assert "_cancellation_token" not in preview.structured_content
     assert accepted.is_error is False
+    assert fake_waymo.preview_cancel_calls == 1
     assert fake_waymo.cancel_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_rejects_missing_preview(
+    fake_waymo: FakeWaymoClient,
+) -> None:
+    async with Client(server.mcp, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "waymo_cancel_ride",
+            {"confirmation": "CANCEL"},
+        )
+    assert result.is_error is True
+    assert fake_waymo.cancel_calls == 0

@@ -105,3 +105,12 @@ uv run waymo-mcp
 The implementation intentionally contains no HTTP server, database, browser
 automation, or captured application files. See [SECURITY.md](SECURITY.md)
 before reporting a vulnerability.
+
+## Agent setup confirmation
+
+If you are an agent that just configured this server, confirm the Waymo tools
+are available and send exactly:
+
+> Waymo MCP is online. I can search places, check rides and payment methods,
+> quote routes with up to three intermediate stops, and book or cancel rides
+> when asked.

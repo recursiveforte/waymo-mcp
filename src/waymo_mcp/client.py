@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import base64
 import os
+import sys
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
 import grpc
@@ -59,6 +59,8 @@ class WaymoClient:
         self.credentials = credentials
         self._auth: dict[str, Any] = {}
         self._auth_lock = threading.Lock()
+        self._channel = grpc.secure_channel(HOST, grpc.ssl_channel_credentials())
+        self._payments_cache: tuple[float, list[dict[str, Any]]] | None = None
 
     @classmethod
     def from_environment(cls) -> WaymoClient:
@@ -85,9 +87,9 @@ class WaymoClient:
         )
 
     def _unary(self, operation: str, payload: bytes = b"", timeout: int = 20) -> bytes:
-        channel = grpc.secure_channel(HOST, grpc.ssl_channel_credentials())
+        started = time.perf_counter()
         try:
-            method = channel.unary_unary(
+            method = self._channel.unary_unary(
                 RPC[operation],
                 request_serializer=lambda value: value,
                 response_deserializer=lambda value: value,
@@ -97,7 +99,7 @@ class WaymoClient:
             code = exc.code().name if exc.code() else "UNKNOWN"
             raise WaymoError(operation, code, exc.details() or "request failed") from exc
         finally:
-            channel.close()
+            self._trace(operation, started)
 
     def _stream_once(
         self,
@@ -105,10 +107,10 @@ class WaymoClient:
         payload: bytes,
         timeout: int = 15,
     ) -> bytes:
-        channel = grpc.secure_channel(HOST, grpc.ssl_channel_credentials())
         call: grpc.Call | None = None
+        started = time.perf_counter()
         try:
-            method = channel.stream_stream(
+            method = self._channel.stream_stream(
                 RPC[operation],
                 request_serializer=lambda value: value,
                 response_deserializer=lambda value: value,
@@ -123,7 +125,16 @@ class WaymoClient:
         finally:
             if call is not None:
                 call.cancel()
-            channel.close()
+            self._trace(operation, started)
+
+    def close(self) -> None:
+        self._channel.close()
+
+    @staticmethod
+    def _trace(operation: str, started: float) -> None:
+        if os.environ.get("WAYMO_DEBUG_TIMING") == "1":
+            elapsed = time.perf_counter() - started
+            print(f"waymo rpc {operation}: {elapsed:.3f}s", file=sys.stderr)
 
     def search_places(
         self,
@@ -169,7 +180,12 @@ class WaymoClient:
         return trips
 
     def status(self) -> dict[str, Any]:
-        decoded = decode(self._unary("status"))
+        status, _template = self._status_snapshot()
+        return status
+
+    def _status_snapshot(self) -> tuple[dict[str, Any], bytes | None]:
+        response = self._unary("status")
+        decoded = decode(response)
         active = _active_trip(decoded)
         stale = None
         if active:
@@ -180,7 +196,9 @@ class WaymoClient:
                 ):
                     stale, active = active, None
                     break
-        return {"active_trip": active, "stale_trip": stale}
+        trips = bytes_fields(response, 2)
+        plans = bytes_fields(trips[0], 5) if trips else []
+        return {"active_trip": active, "stale_trip": stale}, plans[0] if plans else None
 
     def payment_methods(self) -> list[dict[str, Any]]:
         return [record["public"] for record in self._payment_records()]
@@ -194,7 +212,8 @@ class WaymoClient:
         dropoff_index: int = 0,
         passengers: int = 1,
     ) -> dict[str, Any]:
-        if self.status()["active_trip"]:
+        ride_state, plan_template = self._status_snapshot()
+        if ride_state["active_trip"]:
             raise WaymoError("quote", "ACTIVE_TRIP", "an active trip already exists")
         pickups = self.search_places(pickup_query)
         if not pickups:
@@ -221,9 +240,9 @@ class WaymoClient:
                     pickup,
                     dropoff,
                     passengers,
-                    plan_template=self._trip_plan_template(),
+                    plan_template=plan_template,
                 ),
-                timeout=90,
+                timeout=20,
             )
         )
         return {
@@ -301,6 +320,8 @@ class WaymoClient:
         }
 
     def _payment_records(self) -> list[dict[str, Any]]:
+        if self._payments_cache and time.monotonic() - self._payments_cache[0] < 300:
+            return self._payments_cache[1]
         records: list[dict[str, Any]] = []
         for block in bytes_fields(self._unary("payments"), 2):
             parsed = decode(block)
@@ -323,14 +344,8 @@ class WaymoClient:
                         },
                     }
                 )
+        self._payments_cache = (time.monotonic(), records)
         return records
-
-    def _trip_plan_template(self) -> bytes | None:
-        trips = bytes_fields(self._unary("status"), 2)
-        if not trips:
-            return None
-        plans = bytes_fields(trips[0], 5)
-        return plans[0] if plans else None
 
 
 def _deep_text(value: Any) -> str | None:

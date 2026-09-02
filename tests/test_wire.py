@@ -68,12 +68,22 @@ def test_template_replacement_removes_stale_waypoints() -> None:
 
 def test_quote_parser_reads_proposal_and_fare() -> None:
     money = string(1, "USD") + string(2, "12.34")
-    offer = string(1, "proposal-123") + message(2, message(3, money))
+    standard_pricing = message(1, money)
+    pricing = message(3, standard_pricing)
+    offer = string(1, "proposal-123") + message(2, pricing)
     quote = parse_quote(message(3, offer))
     assert quote == {
         "proposal_token": "proposal-123",
         "estimated_fare": "$12.34",
     }
+
+
+def test_quote_parser_ignores_large_route_payload() -> None:
+    money = string(1, "USD") + string(2, "12.34")
+    pricing = message(3, message(1, money))
+    route = message(4, b"\xff" * 1_000_000)
+    offer = string(1, "proposal-123") + message(2, pricing) + route
+    assert parse_quote(message(3, offer))["estimated_fare"] == "$12.34"
 
 
 def test_active_trip_parser() -> None:

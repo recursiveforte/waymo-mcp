@@ -230,36 +230,44 @@ def propose_trip_request(
     )
 
 
-def _money_values(value: Any) -> list[tuple[str, str]]:
-    found: list[tuple[str, str]] = []
-    if isinstance(value, dict):
-        currency, amount = text(value.get("1")), text(value.get("2"))
-        try:
-            if currency == "USD" and Decimal(amount) >= 0:
-                found.append((currency, amount))
-        except (InvalidOperation, ValueError):
-            pass
-        for child in value.values():
-            found.extend(_money_values(child))
-    elif isinstance(value, list):
-        for child in value:
-            found.extend(_money_values(child))
-    return found
+def _money(data: bytes) -> tuple[str, str] | None:
+    currencies = bytes_fields(data, 1)
+    amounts = bytes_fields(data, 2)
+    if not currencies or not amounts:
+        return None
+    currency = currencies[0].decode(errors="replace")
+    amount = amounts[0].decode(errors="replace")
+    try:
+        if currency == "USD" and Decimal(amount) >= 0:
+            return currency, amount
+    except (InvalidOperation, ValueError):
+        pass
+    return None
 
 
 def parse_quote(response: bytes) -> dict[str, Any]:
     offers = bytes_fields(response, 3)
     if not offers:
         raise ValueError("Waymo returned no trip proposal")
-    tokens = bytes_fields(offers[0], 1)
+    offer = offers[0]
+    tokens = bytes_fields(offer, 1)
     token = tokens[0].decode(errors="replace") if tokens else ""
     if not token:
         raise ValueError("Waymo returned a proposal without a booking token")
-    parsed = decode(offers[0])
-    prices = _money_values(parsed.get("2", {}) if isinstance(parsed, dict) else {})
+
+    # gjl.pricing (2) -> fws.standard_pricing (3) ->
+    # fww.estimated_total (1) -> fxb { currency (1), amount (2) }.
+    #
+    # Do not run blackboxprotobuf over the full gjl response here. A real
+    # proposal contains large repeated route messages that make its heuristic
+    # schema inference pathologically expensive.
+    prices = bytes_fields(offer, 2)
+    standard = bytes_fields(prices[0], 3) if prices else []
+    totals = bytes_fields(standard[0], 1) if standard else []
+    estimated_total = _money(totals[0]) if totals else None
     return {
         "proposal_token": token,
-        "estimated_fare": f"${prices[0][1]}" if prices else None,
+        "estimated_fare": f"${estimated_total[1]}" if estimated_total else None,
     }
 
 

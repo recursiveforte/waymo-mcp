@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import threading
 import time
 from typing import Annotated, Any, Literal
@@ -35,6 +36,7 @@ def _get_client() -> WaymoClient:
         if _client is None:
             try:
                 _client = WaymoClient.from_environment()
+                atexit.register(_client.close)
             except (OSError, ValueError) as exc:
                 raise ToolError(
                     "Waymo credentials are not configured. Set WAYMO_REFRESH_TOKEN "

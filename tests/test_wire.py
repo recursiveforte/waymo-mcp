@@ -48,7 +48,31 @@ def test_trip_plan_uses_verified_fields() -> None:
     assert bytes_fields(leg, 3)
     assert bytes_fields(leg, 8)
     assert not bytes_fields(leg, 4)
+    assert decode(bytes_fields(leg, 8)[0])["1"] == 1
     assert decode(request)["13"] == 1
+
+
+def test_multi_stop_plan_builds_linked_legs() -> None:
+    request = propose_trip_request(
+        sample_place("Pickup", 37.51, -122.25),
+        sample_place("Dropoff", 37.54, -122.28),
+        intermediate_stops=[
+            sample_place("Stop 1", 37.52, -122.26),
+            sample_place("Stop 2", 37.53, -122.27),
+        ],
+    )
+    legs = bytes_fields(bytes_fields(request, 2)[0], 5)
+    assert len(legs) == 3
+
+    decoded_legs = [decode(leg) for leg in legs]
+    assert decoded_legs[0]["2"]["3"]["8"]["1"] == b"Pickup"
+    assert decoded_legs[0]["3"]["3"]["8"]["1"] == b"Stop 1"
+    assert decoded_legs[1]["2"]["3"]["8"]["1"] == b"Stop 1"
+    assert decoded_legs[1]["3"]["3"]["8"]["1"] == b"Stop 2"
+    assert decoded_legs[2]["2"]["3"]["8"]["1"] == b"Stop 2"
+    assert decoded_legs[2]["3"]["3"]["8"]["1"] == b"Dropoff"
+    assert decoded_legs[0]["3"]["9"] == decoded_legs[1]["2"]["9"]
+    assert decoded_legs[1]["3"]["9"] == decoded_legs[2]["2"]["9"]
 
 
 def test_template_replacement_removes_stale_waypoints() -> None:

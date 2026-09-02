@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import secrets
+import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 
 def varint(value: int) -> bytes:
@@ -102,6 +102,52 @@ def replace_messages(data: bytes, replacements: dict[int, bytes]) -> bytes:
     return bytes(output)
 
 
+def replace_repeated_messages(data: bytes, field_number: int, values: list[bytes]) -> bytes:
+    output = bytearray()
+    inserted = False
+    for field, wire_type, value in iter_fields(data):
+        if field == field_number and wire_type == 2:
+            if not inserted:
+                for replacement in values:
+                    output.extend(message(field_number, replacement))
+                inserted = True
+            continue
+        if wire_type == 0:
+            output.extend(integer(field, int(value)))
+        elif wire_type in (1, 5):
+            assert isinstance(value, bytes)
+            output.extend(key(field, wire_type) + value)
+        elif wire_type == 2:
+            assert isinstance(value, bytes)
+            output.extend(message(field, value))
+    if not inserted:
+        for replacement in values:
+            output.extend(message(field_number, replacement))
+    return bytes(output)
+
+
+def replace_integer(data: bytes, field_number: int, replacement: int) -> bytes:
+    output = bytearray()
+    replaced = False
+    for field, wire_type, value in iter_fields(data):
+        if field == field_number and wire_type == 0:
+            if not replaced:
+                output.extend(integer(field_number, replacement))
+                replaced = True
+            continue
+        if wire_type == 0:
+            output.extend(integer(field, int(value)))
+        elif wire_type in (1, 5):
+            assert isinstance(value, bytes)
+            output.extend(key(field, wire_type) + value)
+        elif wire_type == 2:
+            assert isinstance(value, bytes)
+            output.extend(message(field, value))
+    if not replaced:
+        output.extend(integer(field_number, replacement))
+    return bytes(output)
+
+
 def decode(data: bytes) -> Any:
     import blackboxprotobuf
 
@@ -188,9 +234,9 @@ def parse_places(response: bytes) -> list[Place]:
     return places
 
 
-def _waypoint(place: Place, role: int) -> bytes:
-    uid = secrets.randbelow(2**62 - 1) + 1
-    return message(3, place._ggq) + integer(7, role) + integer(9, uid)
+def _waypoint(place: Place, uid: int) -> bytes:
+    # ggw: desired location (3), SEARCH source (7), stable waypoint uid (9).
+    return message(3, place._ggq) + integer(7, 2) + integer(9, uid)
 
 
 def propose_trip_request(
@@ -198,28 +244,38 @@ def propose_trip_request(
     dropoff: Place,
     passengers: int = 1,
     *,
+    intermediate_stops: Sequence[Place] = (),
     plan_template: bytes | None = None,
 ) -> bytes:
     if passengers < 1:
         raise ValueError("passengers must be at least 1")
-    passenger_value = passengers - 1
-    passenger = integer(1, passenger_value) if passenger_value else b""
+    if len(intermediate_stops) > 3:
+        raise ValueError("at most 3 intermediate stops are supported")
+
+    places = [pickup, *intermediate_stops, dropoff]
+    first_uid = int(time.time() * 1000)
+    waypoint_uids = [first_uid + index for index in range(len(places))]
+    passenger = integer(1, passengers)
+    legs = [
+        message(2, _waypoint(origin, waypoint_uids[index]))
+        + message(3, _waypoint(destination, waypoint_uids[index + 1]))
+        + message(8, passenger)
+        for index, (origin, destination) in enumerate(zip(places, places[1:]))
+    ]
+
     if plan_template:
-        legs = bytes_fields(plan_template, 5)
-        if not legs:
-            raise ValueError("trip plan template has no leg")
-        leg = replace_messages(
-            legs[0],
-            {2: _waypoint(pickup, 2), 3: _waypoint(dropoff, 7)},
+        configurations = bytes_fields(plan_template, 3)
+        configuration = (
+            replace_integer(configurations[0], 1, passengers)
+            if configurations
+            else passenger
         )
-        plan = replace_messages(plan_template, {5: leg})
+        plan = replace_messages(plan_template, {3: configuration})
+        plan = replace_repeated_messages(plan, 5, legs)
     else:
-        leg = (
-            message(2, _waypoint(pickup, 2))
-            + message(3, _waypoint(dropoff, 7))
-            + message(8, passenger)
-        )
-        plan = integer(1, 1) + message(3, passenger) + message(5, leg)
+        plan = integer(1, 1) + message(3, passenger)
+        for leg in legs:
+            plan += message(5, leg)
     return (
         message(2, plan)
         + integer(3, 1)

@@ -208,10 +208,14 @@ class WaymoClient:
         pickup_query: str,
         dropoff_query: str,
         *,
+        intermediate_stop_queries: list[str] | None = None,
         pickup_index: int = 0,
         dropoff_index: int = 0,
         passengers: int = 1,
     ) -> dict[str, Any]:
+        intermediate_stop_queries = intermediate_stop_queries or []
+        if len(intermediate_stop_queries) > 3:
+            raise ValueError("at most 3 intermediate stops are supported")
         ride_state, plan_template = self._status_snapshot()
         if ride_state["active_trip"]:
             raise WaymoError("quote", "ACTIVE_TRIP", "an active trip already exists")
@@ -222,10 +226,24 @@ class WaymoClient:
             pickup = pickups[pickup_index]
         except IndexError as exc:
             raise ValueError("pickup_index is outside the search results") from exc
+
+        intermediate_stops: list[Place] = []
+        previous = pickup
+        for query in intermediate_stop_queries:
+            results = self.search_places(
+                query,
+                bias_lat=previous.latitude,
+                bias_lng=previous.longitude,
+            )
+            if not results:
+                raise WaymoError("quote", "STOP_NOT_FOUND", query)
+            previous = results[0]
+            intermediate_stops.append(previous)
+
         dropoffs = self.search_places(
             dropoff_query,
-            bias_lat=pickup.latitude,
-            bias_lng=pickup.longitude,
+            bias_lat=previous.latitude,
+            bias_lng=previous.longitude,
         )
         if not dropoffs:
             raise WaymoError("quote", "DROPOFF_NOT_FOUND", dropoff_query)
@@ -240,6 +258,7 @@ class WaymoClient:
                     pickup,
                     dropoff,
                     passengers,
+                    intermediate_stops=intermediate_stops,
                     plan_template=plan_template,
                 ),
                 timeout=20,
@@ -248,6 +267,7 @@ class WaymoClient:
         return {
             **result,
             "pickup": pickup.public(),
+            "intermediate_stops": [stop.public() for stop in intermediate_stops],
             "dropoff": dropoff.public(),
             "passengers": passengers,
         }

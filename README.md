@@ -9,7 +9,7 @@ It gives an agent seven tools:
 - Get ride history
 - Get active ride status
 - List safe payment-method labels
-- Get a ride quote
+- Get a ride quote with up to three intermediate stops
 - Book a quoted ride
 - Cancel the active ride
 
@@ -80,7 +80,7 @@ You can give an agent this repository URL and say:
 
 - Resolve ambiguous places before quoting.
 - Before booking, check status, list payment methods, and get a fresh quote.
-- Show the canonical pickup, dropoff, and fare before booking.
+- Show the canonical pickup, ordered stops, dropoff, and fare before booking.
 - Only pass `confirmation: "BOOK"` after the user explicitly asks to book.
 - Only pass `confirmation: "CANCEL"` after the user explicitly asks to cancel.
 - Never retry booking or cancellation after `OUTCOME_UNKNOWN`; check status.

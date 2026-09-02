@@ -17,6 +17,7 @@ def place(name: str) -> Place:
 class FakeWaymoClient:
     def __init__(self) -> None:
         self.book_calls: list[tuple[str, str]] = []
+        self.quote_calls: list[dict[str, Any]] = []
         self.cancel_calls = 0
 
     def search_places(self, query: str, **_: Any) -> list[Place]:
@@ -31,11 +32,14 @@ class FakeWaymoClient:
     def payment_methods(self) -> list[dict[str, Any]]:
         return [{"id": "card-1", "type": "card", "label": "Card ending in 1234"}]
 
-    def quote(self, pickup: str, dropoff: str, **_: Any) -> dict[str, Any]:
+    def quote(self, pickup: str, dropoff: str, **options: Any) -> dict[str, Any]:
+        self.quote_calls.append(options)
+        stops = options.get("intermediate_stop_queries") or []
         return {
             "proposal_token": "proposal-1",
             "estimated_fare": "$12.34",
             "pickup": place(pickup).public(),
+            "intermediate_stops": [place(stop).public() for stop in stops],
             "dropoff": place(dropoff).public(),
             "passengers": 1,
         }
@@ -98,6 +102,29 @@ async def test_quote_then_book_uses_server_issued_token(
         )
     assert booked.is_error is False
     assert fake_waymo.book_calls == [("proposal-1", "card-1")]
+
+
+@pytest.mark.asyncio
+async def test_quote_accepts_ordered_intermediate_stops(
+    fake_waymo: FakeWaymoClient,
+) -> None:
+    async with Client(server.mcp, raise_exceptions=True) as client:
+        quote = await client.call_tool(
+            "waymo_get_quote",
+            {
+                "pickup": "SFO",
+                "intermediate_stops": ["Stop 1", "Stop 2"],
+                "dropoff": "Oracle",
+            },
+        )
+    assert quote.is_error is False
+    assert [
+        stop["name"] for stop in quote.structured_content["intermediate_stops"]
+    ] == ["Stop 1", "Stop 2"]
+    assert fake_waymo.quote_calls[-1]["intermediate_stop_queries"] == [
+        "Stop 1",
+        "Stop 2",
+    ]
 
 
 @pytest.mark.asyncio

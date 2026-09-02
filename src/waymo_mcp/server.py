@@ -128,15 +128,23 @@ def waymo_get_quote(
         str,
         Field(min_length=1, description="Dropoff name or address"),
     ],
+    intermediate_stops: Annotated[
+        list[str] | None,
+        Field(
+            max_length=3,
+            description="Ordered intermediate stop names or addresses",
+        ),
+    ] = None,
     pickup_result_index: Annotated[int, Field(ge=0)] = 0,
     dropoff_result_index: Annotated[int, Field(ge=0)] = 0,
     passengers: Annotated[int, Field(ge=1, le=4)] = 1,
 ) -> dict[str, Any]:
-    """Resolve both endpoints and create a short-lived Waymo booking proposal."""
+    """Resolve the route and create a short-lived Waymo booking proposal."""
     quote = _call(
         _get_client().quote,
         pickup,
         dropoff,
+        intermediate_stop_queries=intermediate_stops,
         pickup_index=pickup_result_index,
         dropoff_index=dropoff_result_index,
         passengers=passengers,

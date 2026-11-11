@@ -6,6 +6,7 @@ from waymo_mcp.client import _active_trip, _normalize_trip_id
 from waymo_mcp.wire import (
     Place,
     bytes_fields,
+    create_trip_request,
     decode,
     integer,
     lat_lng,
@@ -249,3 +250,13 @@ def test_closest_picks_the_nearest_place() -> None:
     showpad = Place("Showpad", "301 Howard St #500", 37.7897, -122.3943, None, b"")
     howard = Place("500 Howard St", "500 Howard St", 37.7884, -122.3965, None, b"")
     assert closest([showpad, howard], (37.7883, -122.3963)) is howard
+
+
+def test_create_trip_request_matches_android_card_on_file() -> None:
+    request = create_trip_request("proposal-token", "1794431177")
+    assert decode(request) == {
+        "5": 7,
+        "6": b"1794431177",
+        "8": b"proposal-token",
+        "12": {"3": 3},
+    }

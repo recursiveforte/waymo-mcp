@@ -452,9 +452,19 @@ def parse_cancellation_fee(data: bytes) -> str | None:
     return None
 
 
-def create_trip_request(proposal_token: str, payment_token: str) -> bytes:
-    payment = string(1, payment_token) + integer(3, 3)
-    return string(8, proposal_token) + integer(5, 1) + message(12, payment)
+# CreateTripRequest, as the Android app (com.waymo.carapp) builds it for a saved card:
+#   8 proposal token, 5 = 7 (Android client), 6 = the payment method id from
+#   ListPaymentMethods (its field 3), 12 = PaymentMethodInfo {3: 3 (card on file)}.
+# PaymentMethodInfo field 1 is a Braintree nonce, used only for new Google Pay /
+# PayPal payments; putting a saved card's token there made Waymo try to charge it
+# as a nonce, failing with FAILED_PRECONDITION "Failed auth charge".
+def create_trip_request(proposal_token: str, payment_method_id: str) -> bytes:
+    return (
+        integer(5, 7)
+        + string(6, payment_method_id)
+        + string(8, proposal_token)
+        + message(12, integer(3, 3))
+    )
 
 
 def cancel_trip_request(cancellation_token: str) -> bytes:

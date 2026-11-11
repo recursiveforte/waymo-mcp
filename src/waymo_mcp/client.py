@@ -398,7 +398,7 @@ class WaymoClient:
         try:
             self._unary(
                 "book",
-                create_trip_request(proposal_token, payment["booking_token"]),
+                create_trip_request(proposal_token, payment["public"]["id"]),
                 timeout=30,
             )
         except WaymoError as exc:
@@ -486,13 +486,11 @@ class WaymoClient:
             if not isinstance(parsed, dict):
                 continue
             method_id = text(parsed.get("3"))
-            booking_token = _find_hex_token(parsed)
             details = parsed.get("1", {})
             last_four = text(details.get("2")) if isinstance(details, dict) else ""
-            if method_id and booking_token:
+            if method_id:
                 records.append(
                     {
-                        "booking_token": booking_token,
                         "public": {
                             "id": method_id,
                             "type": "card",
@@ -704,25 +702,6 @@ def _timestamp(value: Any) -> float | None:
     nanos = int(value.get("2", 0))
     return seconds + nanos / 1_000_000_000
 
-
-def _find_hex_token(value: Any) -> str | None:
-    if isinstance(value, dict):
-        for child in value.values():
-            result = _find_hex_token(child)
-            if result:
-                return result
-    elif isinstance(value, list):
-        for child in value:
-            result = _find_hex_token(child)
-            if result:
-                return result
-    else:
-        candidate = text(value)
-        if len(candidate) == 32 and all(
-            character in "0123456789abcdef" for character in candidate
-        ):
-            return candidate
-    return None
 
 
 def closest(places: list[Place], point: tuple[float, float]) -> Place:

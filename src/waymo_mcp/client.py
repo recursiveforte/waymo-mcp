@@ -70,6 +70,15 @@ TRIP_STATES = {
     110: "COMPLETED",
     120: "CANCELLED",
 }
+# A finished trip can stay in Waymo's status as "active_trip" for a while; it doesn't block a new ride.
+TERMINAL_TRIP_STATES = {110, 120}
+
+
+def _blocking_trip(ride_state: dict[str, Any]) -> bool:
+    trip = ride_state.get("active_trip")
+    return bool(trip) and trip.get("state_code") not in TERMINAL_TRIP_STATES
+
+
 VEHICLE_TYPES = {
     0: "VEHICLE_TYPE_UNSPECIFIED",
     2: "V5",
@@ -284,7 +293,7 @@ class WaymoClient:
         if any(index < 0 for index in intermediate_stop_indices):
             raise ValueError("intermediate stop indices cannot be negative")
         ride_state, plan_template = self._status_snapshot()
-        if ride_state["active_trip"]:
+        if _blocking_trip(ride_state):
             raise WaymoError("quote", "ACTIVE_TRIP", "an active trip already exists")
         pickups = self.search_places(pickup_query)
         if not pickups:
@@ -361,7 +370,7 @@ class WaymoClient:
         }
 
     def book(self, proposal_token: str, payment_method_id: str) -> dict[str, Any]:
-        if self.status()["active_trip"]:
+        if _blocking_trip(self.status()):
             raise WaymoError("book", "ACTIVE_TRIP", "an active trip already exists")
         payment = next(
             (

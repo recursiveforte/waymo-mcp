@@ -275,7 +275,14 @@ def waymo_book_ride(
     ),
 )
 def waymo_preview_cancellation() -> dict[str, Any]:
-    """Preview cancellation and its fee without cancelling the active ride."""
+    """Preview cancellation and its fee without cancelling the active ride.
+
+    cancellation_fee is what cancelling now costs, read from the app's cancel
+    sheet ("$0.00" inside the free-cancel window); free_until says until when it's
+    free if known, fee_after_free_window what it costs after that. If
+    fee_available is false the fee is unknown: policy_fee is only the most it
+    could cost.
+    """
     global _cancel_preview
     preview = _call(_get_client().preview_cancel)
     token = preview.pop("_cancellation_token", None)

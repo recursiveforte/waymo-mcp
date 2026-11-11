@@ -27,6 +27,7 @@ from .wire import (
     create_trip_request,
     decode,
     parse_cancellation_fee,
+    parse_cancellation_ux,
     parse_places,
     parse_quote,
     place_search_request,
@@ -75,9 +76,63 @@ TRIP_STATES = {
 TERMINAL_TRIP_STATES = {110, 120}
 
 
+CANCELLED_STATE = 120
+
+
 def _blocking_trip(ride_state: dict[str, Any]) -> bool:
     trip = ride_state.get("active_trip")
     return bool(trip) and trip.get("state_code") not in TERMINAL_TRIP_STATES
+
+
+def _cancelled_trip_state(response: bytes, trip_id: str) -> str | None:
+    """The trip's state from a CancelActiveTripResponse, if it names that trip."""
+    if not response:
+        return None
+    try:
+        trip = _active_trip(decode(response))
+    except Exception:
+        return None
+    if not trip or trip["trip_id"] != trip_id or not trip.get("state_code"):
+        return None
+    return trip["state"]
+
+
+def _trip_state_after_cancel(ride_state: dict[str, Any], trip_id: str) -> str:
+    stale = ride_state.get("stale_trip")
+    if stale and stale.get("trip_id") == trip_id:
+        return "CANCELLED"  # history already lists it as cancelled
+    active = ride_state.get("active_trip")
+    if not active or active.get("trip_id") != trip_id:
+        return "CANCELLED"  # gone from the active trip
+    return str(active.get("state"))
+
+
+def cancellation_fee_summary(proposal: bytes, sheet: bytes | None) -> dict[str, Any]:
+    """Fee for cancelling now, from the app's cancel sheet; the policy fee is a fallback.
+
+    ProposeTripCancellation carries the policy fee (e.g. $4.99) even inside the
+    free-cancel window, when nothing is charged, so it's never reported as the fee.
+    """
+    policy_fee = parse_cancellation_fee(proposal)
+    ux = parse_cancellation_ux(sheet) if sheet else None
+    if ux and ux["cancellation_fee"] is not None:
+        if ux["fee_after_free_window"] is None and ux["free_cancellation"]:
+            ux["fee_after_free_window"] = policy_fee
+        return {**ux, "fee_available": True, "fee_source": "app_cancel_sheet"}
+    return {
+        "cancellation_fee": None,
+        "free_cancellation": None,
+        "free_until": None,
+        "fee_after_free_window": None,
+        "policy_fee": policy_fee,
+        "cancel_sheet_text": ux["cancel_sheet_text"] if ux else [],
+        "fee_available": False,
+        "fee_source": None,
+        "note": (
+            "Couldn't read the app's cancel sheet. policy_fee is the most it can "
+            "cost; it's free inside Waymo's free-cancel window (e.g. right after booking)."
+        ),
+    }
 
 
 VEHICLE_TYPES = {
@@ -420,7 +475,7 @@ class WaymoClient:
 
     def preview_cancel(self) -> dict[str, Any]:
         before = self.status()["active_trip"]
-        if not before:
+        if not before or before.get("state_code") in TERMINAL_TRIP_STATES:
             return {"can_cancel": False, "reason": "no_active_trip"}
         proposal = self._unary("propose_cancel")
         tokens = bytes_fields(proposal, 2)
@@ -430,17 +485,14 @@ class WaymoClient:
                 "TOKEN_MISSING",
                 "Waymo returned no cancellation token",
             )
-        fee = parse_cancellation_fee(proposal)
-        if fee is None:
-            try:
-                fee = parse_cancellation_fee(self._unary("cancel_fee_ux"))
-            except WaymoError:
-                pass
+        try:
+            sheet: bytes | None = self._unary("cancel_fee_ux")
+        except WaymoError:
+            sheet = None
         return {
             "can_cancel": True,
             "trip_id": before["trip_id"],
-            "cancellation_fee": fee,
-            "fee_available": fee is not None,
+            **cancellation_fee_summary(proposal, sheet),
             "_cancellation_token": tokens[0].decode(errors="replace"),
         }
 
@@ -458,8 +510,15 @@ class WaymoClient:
                 "TRIP_CHANGED",
                 "the active trip changed after cancellation preview",
             )
+        if before.get("state_code") == CANCELLED_STATE:
+            return {
+                "cancelled": True,
+                "trip_id": before["trip_id"],
+                "state": "CANCELLED",
+                "already_cancelled": True,
+            }
         try:
-            self._unary(
+            response = self._unary(
                 "cancel",
                 cancel_trip_request(cancellation_token),
                 timeout=20,
@@ -472,9 +531,16 @@ class WaymoClient:
                     "do not retry; check ride status first",
                 ) from exc
             raise
+        # CancelActiveTripResponse is {2: the trip}; a cancelled trip has state 120.
+        state = _cancelled_trip_state(response, before["trip_id"])
+        if state is None:
+            # Ambiguous response: the trip lingers in GetActiveTrip as CANCELLED
+            # for a while, so judge by its state, not by whether it's gone.
+            state = _trip_state_after_cancel(self._status_snapshot()[0], before["trip_id"])
         return {
-            "cancelled": self.status()["active_trip"] is None,
+            "cancelled": state == "CANCELLED",
             "trip_id": before["trip_id"],
+            "state": state,
         }
 
     def _payment_records(self) -> list[dict[str, Any]]:

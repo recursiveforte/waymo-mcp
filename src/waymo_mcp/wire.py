@@ -422,6 +422,110 @@ def _scheduled_option(data: bytes) -> dict[str, Any] | None:
     return result
 
 
+def ux_texts(data: bytes) -> list[str]:
+    """Human-readable strings in a server-driven UI message, in wire order."""
+    texts: list[str] = []
+
+    def human(value: bytes) -> str | None:
+        try:
+            rendered = value.decode()
+        except UnicodeDecodeError:
+            return None
+        if not rendered or rendered[0] in "\n\x12\x1a" or not re.search(r"[A-Za-z]", rendered):
+            return None
+        if any(not (ch.isprintable() or ch == "\n") for ch in rendered):
+            return None
+        # Tokens, ids and URLs, not copy.
+        if " " not in rendered and (
+            len(rendered) > 24 or "://" in rendered or "_" in rendered
+        ):
+            return None
+        return rendered.strip()
+
+    def walk(current: bytes, depth: int) -> None:
+        try:
+            fields = list(iter_fields(current))
+        except ValueError:
+            return
+        for _field, wire_type, value in fields:
+            if wire_type != 2 or not isinstance(value, bytes):
+                continue
+            rendered = human(value)
+            if rendered:
+                texts.append(rendered)
+            elif depth < 40:
+                walk(value, depth + 1)
+
+    walk(data, 0)
+    return texts
+
+
+_DOLLARS = re.compile(r"\$\s*(\d+(?:\.\d{2})?)")
+_FREE = re.compile(
+    r"\b(?:for free|free(?: of charge)?|no (?:cancellation )?(?:fee|charge)|"
+    r"won[’']?t be charged|will not be charged|not be charged|at no cost|waived)\b",
+    re.IGNORECASE,
+)
+_FREE_ENDED = re.compile(r"\b(?:ended|expired|no longer|has passed)\b", re.IGNORECASE)
+_UNTIL_CLOCK = re.compile(
+    r"\b(?:until|before|by)\s+(\d{1,2}:\d{2})\s*([AaPp]\.?[Mm]\.?)?",
+    re.IGNORECASE,
+)
+_MINUTES = re.compile(
+    r"\b(?:within|in the next|for (?:the next |another )?|next|after)\s*(\d+)\s*"
+    r"(?:more\s+)?(?:min|minute)s?\b",
+    re.IGNORECASE,
+)
+
+
+def parse_cancellation_ux(data: bytes, now: float | None = None) -> dict[str, Any]:
+    """What the app's cancel sheet (GetCancellationFeeUx) says the rider pays now.
+
+    The Android app (com.waymo.carapp 26092803) never calls ProposeTripCancellation:
+    it calls GetCancellationFeeUx and shows the returned server-driven bottom sheet
+    (response field 2 -> {1: sheet}) as is. That sheet's copy is the fee the rider
+    sees, including free-cancel windows; ProposeTripCancellation's money is only
+    the policy amount, which isn't charged inside the free window.
+    """
+    now = time.time() if now is None else now
+    texts = ux_texts(data)
+    joined = " ".join(texts)
+    amounts = [f"${amount}" for amount in _DOLLARS.findall(joined)]
+    free = bool(_FREE.search(joined)) and not _FREE_ENDED.search(joined)
+    if free:
+        fee: str | None = "$0.00"
+        fee_after = next(
+            (amount for amount in amounts if amount not in {"$0", "$0.00"}), None
+        )
+        free_until = None
+        clock = _UNTIL_CLOCK.search(joined)
+        minutes = _MINUTES.search(joined)
+        if clock:
+            free_until = _clock_today(clock.group(1), clock.group(2), now)
+        elif minutes:
+            free_until = _local_iso(now + int(minutes.group(1)) * 60)
+    else:
+        fee = amounts[0] if amounts else None
+        fee_after = free_until = None
+    return {
+        "cancellation_fee": fee,
+        "free_cancellation": free if (free or amounts) else None,
+        "free_until": free_until,
+        "fee_after_free_window": fee_after,
+        "cancel_sheet_text": texts,
+    }
+
+
+def _clock_today(clock: str, meridiem: str | None, now: float) -> str | None:
+    hour, minute = (int(part) for part in clock.split(":"))
+    if meridiem:
+        hour = hour % 12 + (12 if meridiem.lower().startswith("p") else 0)
+    if hour > 23 or minute > 59:
+        return None
+    local = datetime.fromtimestamp(now, PACIFIC)
+    return local.replace(hour=hour, minute=minute, second=0, microsecond=0).isoformat()
+
+
 def parse_cancellation_fee(data: bytes) -> str | None:
     """Extract a structured or rendered USD fee from cancellation preview UX."""
     pending = [data]

@@ -240,3 +240,12 @@ def test_active_trip_parser() -> None:
 
 def test_history_trip_id_normalization() -> None:
     assert _normalize_trip_id("ChAxNzg4MzMwNTgxNDg3ODQ0") == "1788330581487844"
+
+
+def test_closest_picks_the_nearest_place() -> None:
+    from waymo_mcp.client import closest
+    from waymo_mcp.wire import Place
+
+    showpad = Place("Showpad", "301 Howard St #500", 37.7897, -122.3943, None, b"")
+    howard = Place("500 Howard St", "500 Howard St", 37.7884, -122.3965, None, b"")
+    assert closest([showpad, howard], (37.7883, -122.3963)) is howard

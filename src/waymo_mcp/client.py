@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import math
 import os
 import sys
 import threading
@@ -277,6 +278,8 @@ class WaymoClient:
         intermediate_stop_indices: list[int] | None = None,
         pickup_index: int = 0,
         dropoff_index: int = 0,
+        pickup_near: tuple[float, float] | None = None,
+        dropoff_near: tuple[float, float] | None = None,
         passengers: int = 1,
         scheduled_option_token: str | None = None,
     ) -> dict[str, Any]:
@@ -295,13 +298,19 @@ class WaymoClient:
         ride_state, plan_template = self._status_snapshot()
         if _blocking_trip(ride_state):
             raise WaymoError("quote", "ACTIVE_TRIP", "an active trip already exists")
-        pickups = self.search_places(pickup_query)
+        if pickup_near:
+            pickups = self.search_places(pickup_query, bias_lat=pickup_near[0], bias_lng=pickup_near[1])
+        else:
+            pickups = self.search_places(pickup_query)
         if not pickups:
             raise WaymoError("quote", "PICKUP_NOT_FOUND", pickup_query)
-        try:
-            pickup = pickups[pickup_index]
-        except IndexError as exc:
-            raise ValueError("pickup_index is outside the search results") from exc
+        if pickup_near:
+            pickup = closest(pickups, pickup_near)
+        else:
+            try:
+                pickup = pickups[pickup_index]
+            except IndexError as exc:
+                raise ValueError("pickup_index is outside the search results") from exc
 
         intermediate_stops: list[Place] = []
         previous = pickup
@@ -325,17 +334,21 @@ class WaymoClient:
                 ) from exc
             intermediate_stops.append(previous)
 
+        bias = dropoff_near or (previous.latitude, previous.longitude)
         dropoffs = self.search_places(
             dropoff_query,
-            bias_lat=previous.latitude,
-            bias_lng=previous.longitude,
+            bias_lat=bias[0],
+            bias_lng=bias[1],
         )
         if not dropoffs:
             raise WaymoError("quote", "DROPOFF_NOT_FOUND", dropoff_query)
-        try:
-            dropoff = dropoffs[dropoff_index]
-        except IndexError as exc:
-            raise ValueError("dropoff_index is outside the search results") from exc
+        if dropoff_near:
+            dropoff = closest(dropoffs, dropoff_near)
+        else:
+            try:
+                dropoff = dropoffs[dropoff_index]
+            except IndexError as exc:
+                raise ValueError("dropoff_index is outside the search results") from exc
         result = parse_quote(
             self._unary(
                 "quote",
@@ -710,3 +723,13 @@ def _find_hex_token(value: Any) -> str | None:
         ):
             return candidate
     return None
+
+
+def closest(places: list[Place], point: tuple[float, float]) -> Place:
+    """The place nearest point (equirectangular distance; fine at city scale)."""
+    lat0 = math.radians(point[0])
+    return min(
+        places,
+        key=lambda p: (p.latitude - point[0]) ** 2
+        + ((p.longitude - point[1]) * math.cos(lat0)) ** 2,
+    )

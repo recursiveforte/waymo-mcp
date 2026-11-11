@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import atexit
+import fcntl
+import json
+import os
 import secrets
 import threading
 import time
@@ -31,6 +34,8 @@ mcp = MCPServer(
 
 _client: WaymoClient | None = None
 _client_lock = threading.Lock()
+# quote_id -> (wall-clock time issued, quote). With WAYMO_QUOTES_FILE set, quotes live in that 0600 file
+# instead, so a quote_id issued by one server process (e.g. Mandelbot's ride_quote) books from another.
 _quotes: dict[str, tuple[float, dict[str, Any]]] = {}
 _quotes_lock = threading.Lock()
 QUOTE_TTL_SECONDS = 5 * 60
@@ -157,6 +162,14 @@ def waymo_get_quote(
     ] = None,
     pickup_result_index: Annotated[int, Field(ge=0)] = 0,
     dropoff_result_index: Annotated[int, Field(ge=0)] = 0,
+    pickup_near: Annotated[
+        str | None,
+        Field(description="'lat,lng': search around it and take the result closest to it (overrides the index)"),
+    ] = None,
+    dropoff_near: Annotated[
+        str | None,
+        Field(description="'lat,lng': as pickup_near, for the dropoff"),
+    ] = None,
     passengers: Annotated[int, Field(ge=1, le=4)] = 1,
     scheduled_option_token: Annotated[
         str | None,
@@ -176,6 +189,8 @@ def waymo_get_quote(
         intermediate_stop_indices=intermediate_stop_result_indices,
         pickup_index=pickup_result_index,
         dropoff_index=dropoff_result_index,
+        pickup_near=_point(pickup_near),
+        dropoff_near=_point(dropoff_near),
         passengers=passengers,
         scheduled_option_token=scheduled_option_token,
     )
@@ -192,9 +207,7 @@ def waymo_get_quote(
         ).isoformat(),
     }
     quote_id = secrets.token_urlsafe(9)
-    with _quotes_lock:
-        _purge_quotes()
-        _quotes[quote_id] = (time.monotonic(), quote)
+    _store_quote(quote_id, quote)
     public = {key: value for key, value in quote.items() if key != "proposal_token"}
     return {"quote_id": quote_id, **public}
 
@@ -230,11 +243,10 @@ def waymo_book_ride(
 ) -> dict[str, Any]:
     """Book a quoted ride. Call only after the user approved this exact quote."""
     del confirmation
-    with _quotes_lock:
-        # Single-use: consume before booking so a retry or duplicate call can
-        # never order a second ride from the same quote.
-        record = _quotes.pop(quote_id, None)
-    if record is None or time.monotonic() - record[0] > QUOTE_TTL_SECONDS:
+    # Single-use: consume before booking so a retry or duplicate call can
+    # never order a second ride from the same quote.
+    record = _take_quote(quote_id)
+    if record is None or time.time() - record[0] > QUOTE_TTL_SECONDS:
         raise ToolError("Unknown, used or expired quote_id. Call waymo_get_quote again.")
     quote = record[1]
     if expected_fare != quote.get("estimated_fare"):
@@ -311,15 +323,55 @@ def waymo_cancel_ride(confirmation: Literal["CANCEL"]) -> dict[str, Any]:
     return result
 
 
-def _purge_quotes() -> None:
-    now = time.monotonic()
-    expired = [
-        token
-        for token, (created_at, _quote) in _quotes.items()
-        if now - created_at > QUOTE_TTL_SECONDS
-    ]
-    for token in expired:
-        _quotes.pop(token, None)
+def _point(value: str | None) -> tuple[float, float] | None:
+    if value is None:
+        return None
+    try:
+        lat, lng = (float(part) for part in value.split(","))
+    except ValueError as exc:
+        raise ToolError(f"expected 'lat,lng', got {value!r}") from exc
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        raise ToolError(f"coordinates out of range: {value!r}")
+    return lat, lng
+
+
+def _purge_quotes(quotes: dict[str, Any]) -> None:
+    now = time.time()
+    for token in [t for t, (created_at, _q) in quotes.items() if now - created_at > QUOTE_TTL_SECONDS]:
+        quotes.pop(token, None)
+
+
+def _with_quotes(fn: Any) -> Any:
+    """Run fn(quotes) on the quote cache under a lock: the in-memory dict, or the shared file."""
+    path = os.environ.get("WAYMO_QUOTES_FILE")
+    with _quotes_lock:
+        if not path:
+            return fn(_quotes)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with os.fdopen(os.dup(fd), "r+") as f:
+                raw = f.read()
+                quotes = {k: tuple(v) for k, v in (json.loads(raw) if raw.strip() else {}).items()}
+                result = fn(quotes)
+                f.seek(0)
+                f.truncate()
+                f.write(json.dumps(quotes))
+            os.fchmod(fd, 0o600)
+            return result
+        finally:
+            os.close(fd)
+
+
+def _store_quote(quote_id: str, quote: dict[str, Any]) -> None:
+    def put(quotes: dict[str, Any]) -> None:
+        _purge_quotes(quotes)
+        quotes[quote_id] = (time.time(), quote)
+    _with_quotes(put)
+
+
+def _take_quote(quote_id: str) -> tuple[float, dict[str, Any]] | None:
+    return _with_quotes(lambda quotes: quotes.pop(quote_id, None))
 
 
 def main() -> None:

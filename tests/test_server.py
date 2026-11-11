@@ -277,3 +277,33 @@ async def test_cancel_rejects_missing_preview(
         )
     assert result.is_error is True
     assert fake_waymo.cancel_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_quote_passes_near_points(fake_waymo: FakeWaymoClient) -> None:
+    async with Client(server.mcp, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "waymo_get_quote",
+            {"pickup": "home", "dropoff": "500 Howard", "pickup_near": "37.735,-122.4535", "dropoff_near": "37.7884,-122.3965"},
+        )
+    assert result.is_error is False
+    assert fake_waymo.quote_calls[-1]["pickup_near"] == (37.735, -122.4535)
+    assert fake_waymo.quote_calls[-1]["dropoff_near"] == (37.7884, -122.3965)
+
+
+@pytest.mark.asyncio
+async def test_quotes_file_shares_quote_ids_across_processes(
+    fake_waymo: FakeWaymoClient, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "quotes.json"
+    monkeypatch.setenv("WAYMO_QUOTES_FILE", str(path))
+    async with Client(server.mcp, raise_exceptions=True) as client:
+        quote = await _quote(client)
+    assert server._quotes == {}  # nothing in this process's memory
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    async with Client(server.mcp, raise_exceptions=True) as client:
+        booked = await _book(client, quote["quote_id"])
+        again = await _book(client, quote["quote_id"])
+    assert booked.is_error is False
+    assert again.is_error is True
+    assert fake_waymo.book_calls == [("proposal-1", "card-1")]

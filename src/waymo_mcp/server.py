@@ -20,7 +20,8 @@ mcp = MCPServer(
     "waymo-rides",
     instructions=(
         "Manage Waymo rides. Booking is two-step: waymo_get_quote returns a "
-        "quote_id and fare; show pickup, dropoff, fare and ETA to the user, "
+        "quote_id, fare, pickup_eta {at, minutes} and dropoff_eta (Pacific "
+        "ISO); show pickup, dropoff, fare and both ETAs to the user, "
         "and only after they explicitly approve that quote call "
         "waymo_book_ride with the same quote_id and fare. Quotes expire after "
         "five minutes and are single-use. Never retry an OUTCOME_UNKNOWN "

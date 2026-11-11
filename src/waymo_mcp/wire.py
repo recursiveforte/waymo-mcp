@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import math
 import time
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterator, Sequence
+from zoneinfo import ZoneInfo
+
+PACIFIC = ZoneInfo("America/Los_Angeles")
 
 
 def varint(value: int) -> bytes:
@@ -328,15 +332,69 @@ def parse_quote(response: bytes) -> dict[str, Any]:
     standard = bytes_fields(prices[0], 3) if prices else []
     totals = bytes_fields(standard[0], 1) if standard else []
     estimated_total = _money(totals[0]) if totals else None
+    try:
+        pickup_eta, dropoff_eta = _etas(offer, _proposal_time(token))
+    except ValueError:
+        pickup_eta = dropoff_eta = None
     return {
         "proposal_token": token,
         "estimated_fare": f"${estimated_total[1]}" if estimated_total else None,
+        "pickup_eta": pickup_eta,
+        "dropoff_eta": dropoff_eta,
         "scheduled_options": [
             option
             for raw_option in bytes_fields(offer, 9)
             if (option := _scheduled_option(raw_option)) is not None
         ],
     }
+
+
+def _proposal_time(token: str) -> float:
+    # Proposal tokens are the server's creation time in microseconds; waypoint
+    # ETAs are durations from that moment. Fall back to now if that changes.
+    now = time.time()
+    if token.isdigit() and len(token) == 16:
+        created = int(token) / 1_000_000
+        if abs(created - now) < 86_400:
+            return created
+    return now
+
+
+def _duration(data: bytes) -> float | None:
+    # google.protobuf.Duration { seconds (1), nanos (2) }
+    fields = {f: v for f, wt, v in iter_fields(data) if wt == 0}
+    if 1 not in fields:
+        return None
+    return fields[1] + fields.get(2, 0) / 1_000_000_000
+
+
+def _waypoint_eta(waypoint: bytes) -> float | None:
+    # Response waypoint: ETA duration from proposal creation (3).
+    durations = bytes_fields(waypoint, 3)
+    return _duration(durations[0]) if durations else None
+
+
+def _local_iso(timestamp: float) -> str:
+    return datetime.fromtimestamp(round(timestamp), PACIFIC).isoformat()
+
+
+def _etas(offer: bytes, base: float) -> tuple[dict[str, Any] | None, str | None]:
+    # gjl.legs (4) -> { origin waypoint (1), destination waypoint (2) }.
+    legs = bytes_fields(offer, 4)
+    pickup_eta = dropoff_eta = None
+    if legs:
+        origins = bytes_fields(legs[0], 1)
+        seconds = _waypoint_eta(origins[0]) if origins else None
+        if seconds is not None:
+            pickup_eta = {
+                "at": _local_iso(base + seconds),
+                "minutes": math.ceil(seconds / 60),
+            }
+        destinations = bytes_fields(legs[-1], 2)
+        seconds = _waypoint_eta(destinations[0]) if destinations else None
+        if seconds is not None:
+            dropoff_eta = _local_iso(base + seconds)
+    return pickup_eta, dropoff_eta
 
 
 def _scheduled_option(data: bytes) -> dict[str, Any] | None:

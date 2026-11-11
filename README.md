@@ -12,7 +12,7 @@ It gives an agent eight tools:
 - Get ride history
 - Get active ride status, including phase, ETA, vehicle, and arrival data
 - List safe payment-method labels
-- Get immediate or scheduled quotes with up to three intermediate stops
+- Get immediate or scheduled quotes with up to three intermediate stops, including fare, pickup ETA and drop-off time
 - Book a quoted ride
 - Preview a cancellation and its fee
 - Cancel the active ride

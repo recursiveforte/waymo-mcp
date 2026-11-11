@@ -101,8 +101,39 @@ def test_quote_parser_reads_proposal_and_fare() -> None:
     assert quote == {
         "proposal_token": "proposal-123",
         "estimated_fare": "$12.34",
+        "pickup_eta": None,
+        "dropoff_eta": None,
         "scheduled_options": [],
     }
+
+
+def _eta_waypoint(seconds: int, nanos: int) -> bytes:
+    # Response waypoint: ETA as a Duration from proposal creation (field 3).
+    return message(1, b"") + message(3, integer(1, seconds) + integer(2, nanos))
+
+
+def test_quote_parser_reads_pickup_and_dropoff_etas(monkeypatch) -> None:
+    # Shape and values from a live quote (85 Burlwood Dr -> 500 Howard St):
+    # the token is the creation time in µs; the app showed "Pickup in 6 min".
+    monkeypatch.setattr("time.time", lambda: 1794431610.0)
+    legs = [
+        message(1, _eta_waypoint(339, 34484863))
+        + message(2, _eta_waypoint(1200, 0)),
+        message(1, _eta_waypoint(1300, 0))
+        + message(2, _eta_waypoint(2259, 36288219)),
+    ]
+    offer = string(1, "1794431607252710") + b"".join(message(4, leg) for leg in legs)
+    quote = parse_quote(message(3, offer))
+    assert quote["pickup_eta"] == {"at": "2026-11-11T13:19:06-08:00", "minutes": 6}
+    assert quote["dropoff_eta"] == "2026-11-11T13:51:06-08:00"
+
+
+def test_quote_eta_falls_back_to_now_for_opaque_tokens(monkeypatch) -> None:
+    monkeypatch.setattr("time.time", lambda: 1794431607.0)
+    leg = message(1, _eta_waypoint(300, 0)) + message(2, _eta_waypoint(1500, 0))
+    quote = parse_quote(message(3, string(1, "proposal-123") + message(4, leg)))
+    assert quote["pickup_eta"] == {"at": "2026-11-11T13:18:27-08:00", "minutes": 5}
+    assert quote["dropoff_eta"] == "2026-11-11T13:38:27-08:00"
 
 
 def test_quote_parser_ignores_large_route_payload() -> None:

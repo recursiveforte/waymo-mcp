@@ -187,8 +187,8 @@ class WaymoClient:
         self,
         query: str,
         *,
-        bias_lat: float = 37.55,
-        bias_lng: float = -122.30,
+        bias_lat: float = 37.7749,
+        bias_lng: float = -122.4194,
         limit: int = 5,
     ) -> list[Place]:
         query = query.strip()

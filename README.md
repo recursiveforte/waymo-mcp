@@ -1,5 +1,8 @@
 # Waymo MCP
 
+> Fork of nathanielangafor/waymo-mcp with a stricter quote → book flow and
+> San Francisco search defaults.
+
 An unofficial local [Model Context Protocol](https://modelcontextprotocol.io/)
 server for Waymo ride management.
 
@@ -45,8 +48,9 @@ The default credential file has this shape:
 }
 ```
 
-Create it locally with file mode `0600`. Credential acquisition is deliberately
-outside this MCP package. Never commit a capture, token, or credential file.
+Create it locally with file mode `0600`. Credential acquisition is outside the server itself; this fork ships
+`scripts/capture_credentials.py`, a mitmproxy addon that captures your own
+iOS app's refresh token and device id into a 0600 file. Never commit a capture, token, or credential file.
 
 ## 2. Add the MCP server
 
@@ -83,9 +87,13 @@ You can give an agent this repository URL and say:
 - Use result indices to select ambiguous pickup, stop, and dropoff matches.
 - For a scheduled ride, quote once to get available times, then quote again
   with the chosen `scheduled_option_token`.
-- Before booking, check status, list payment methods, and get a fresh quote.
-- Show the canonical pickup, ordered stops, dropoff, and fare before booking.
-- Only pass `confirmation: "BOOK"` after the user explicitly asks to book.
+- Booking is two-step. `waymo_get_quote` returns a server-issued `quote_id`
+  (the raw Waymo proposal token never leaves the server). Show the canonical
+  pickup, ordered stops, dropoff, and fare, and only after the user approves
+  that quote call `waymo_book_ride` with the same `quote_id`, its
+  `expected_fare`, and `confirmation: "BOOK"`.
+- Quote ids are single-use (consumed by any booking attempt, even a failed
+  one) and expire after five minutes, so one call can never order a ride.
 - Before cancellation, call `waymo_preview_cancellation` and show any fee.
 - Only pass `confirmation: "CANCEL"` after the user explicitly confirms that
   preview.
@@ -94,7 +102,7 @@ You can give an agent this repository URL and say:
   user.
 
 The server reinforces these rules with MCP annotations, literal confirmation
-arguments, and a ten-minute in-memory proposal cache. Client annotations are
+arguments, and a five-minute, single-use in-memory quote cache. Client annotations are
 hints, not an authorization boundary; only connect this server to agents you
 trust.
 
@@ -111,12 +119,3 @@ uv run waymo-mcp
 The implementation intentionally contains no HTTP server, database, browser
 automation, or captured application files. See [SECURITY.md](SECURITY.md)
 before reporting a vulnerability.
-
-## Agent setup confirmation
-
-If you are an agent that just configured this server, confirm the Waymo tools
-are available and send exactly:
-
-> Waymo MCP is online. I can search places, check live ride status, quote and
-> schedule multi-stop rides, preview cancellation fees, and book or cancel
-> rides when asked.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import secrets
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -18,9 +19,12 @@ from .client import WaymoClient, WaymoError
 mcp = MCPServer(
     "waymo-rides",
     instructions=(
-        "Manage Waymo rides. Resolve ambiguous places and get a quote before "
-        "booking. Only call booking or cancellation tools after explicit user "
-        "authorization. Never retry an OUTCOME_UNKNOWN mutation; check status."
+        "Manage Waymo rides. Booking is two-step: waymo_get_quote returns a "
+        "quote_id and fare; show pickup, dropoff, fare and ETA to the user, "
+        "and only after they explicitly approve that quote call "
+        "waymo_book_ride with the same quote_id and fare. Quotes expire after "
+        "five minutes and are single-use. Never retry an OUTCOME_UNKNOWN "
+        "mutation; check status."
     ),
 )
 
@@ -28,7 +32,9 @@ _client: WaymoClient | None = None
 _client_lock = threading.Lock()
 _quotes: dict[str, tuple[float, dict[str, Any]]] = {}
 _quotes_lock = threading.Lock()
-QUOTE_TTL_SECONDS = 10 * 60
+QUOTE_TTL_SECONDS = 5 * 60
+SF_LATITUDE = 37.7749
+SF_LONGITUDE = -122.4194
 _cancel_preview: tuple[float, str, str] | None = None
 _cancel_preview_lock = threading.Lock()
 CANCEL_PREVIEW_TTL_SECONDS = 5 * 60
@@ -67,11 +73,11 @@ def waymo_search_places(
     bias_latitude: Annotated[
         float,
         Field(ge=-90, le=90, description="Search center latitude"),
-    ] = 37.55,
+    ] = SF_LATITUDE,
     bias_longitude: Annotated[
         float,
         Field(ge=-180, le=180, description="Search center longitude"),
-    ] = -122.30,
+    ] = SF_LONGITUDE,
     limit: Annotated[int, Field(ge=1, le=10)] = 5,
 ) -> dict[str, Any]:
     """Resolve a place name or address to canonical Waymo locations."""
@@ -184,10 +190,12 @@ def waymo_get_quote(
             datetime.now(timezone.utc) + timedelta(seconds=QUOTE_TTL_SECONDS)
         ).isoformat(),
     }
+    quote_id = secrets.token_urlsafe(9)
     with _quotes_lock:
-        _quotes[quote["proposal_token"]] = (time.monotonic(), quote)
         _purge_quotes()
-    return quote
+        _quotes[quote_id] = (time.monotonic(), quote)
+    public = {key: value for key, value in quote.items() if key != "proposal_token"}
+    return {"quote_id": quote_id, **public}
 
 
 @mcp.tool(
@@ -200,28 +208,48 @@ def waymo_get_quote(
     ),
 )
 def waymo_book_ride(
-    proposal_token: Annotated[
+    quote_id: Annotated[
         str,
-        Field(min_length=1, description="Token returned by waymo_get_quote"),
+        Field(min_length=1, description="quote_id returned by waymo_get_quote"),
     ],
-    payment_method_id: Annotated[
-        str,
-        Field(min_length=1, description="ID returned by waymo_list_payment_methods"),
+    expected_fare: Annotated[
+        str | None,
+        Field(description="The estimated_fare from that quote, as shown to the user"),
     ],
     confirmation: Literal["BOOK"],
+    payment_method_id: Annotated[
+        str | None,
+        Field(
+            description=(
+                "ID from waymo_list_payment_methods; may be omitted when the "
+                "account has exactly one"
+            )
+        ),
+    ] = None,
 ) -> dict[str, Any]:
-    """Book a quoted ride. Call only after the user explicitly requests booking."""
+    """Book a quoted ride. Call only after the user approved this exact quote."""
     del confirmation
     with _quotes_lock:
-        record = _quotes.get(proposal_token)
-        if record is None or time.monotonic() - record[0] > QUOTE_TTL_SECONDS:
+        # Single-use: consume before booking so a retry or duplicate call can
+        # never order a second ride from the same quote.
+        record = _quotes.pop(quote_id, None)
+    if record is None or time.monotonic() - record[0] > QUOTE_TTL_SECONDS:
+        raise ToolError("Unknown, used or expired quote_id. Call waymo_get_quote again.")
+    quote = record[1]
+    if expected_fare != quote.get("estimated_fare"):
+        raise ToolError(
+            "expected_fare does not match the quote. Get a fresh quote and "
+            "confirm its fare with the user."
+        )
+    if payment_method_id is None:
+        methods = _call(_get_client().payment_methods)
+        if len(methods) != 1:
             raise ToolError(
-                "Unknown or expired proposal token. Call waymo_get_quote again."
+                "Pass payment_method_id; the account has "
+                f"{len(methods)} payment methods."
             )
-    result = _call(_get_client().book, proposal_token, payment_method_id)
-    with _quotes_lock:
-        _quotes.pop(proposal_token, None)
-    return result
+        payment_method_id = methods[0]["id"]
+    return _call(_get_client().book, quote["proposal_token"], payment_method_id)
 
 
 @mcp.tool(

@@ -98,26 +98,100 @@ async def test_server_exposes_only_the_eight_core_tools() -> None:
     assert tools["waymo_book_ride"].annotations.idempotent_hint is False
 
 
+async def _quote(client: Client) -> dict[str, Any]:
+    quote = await client.call_tool(
+        "waymo_get_quote",
+        {"pickup": "SFO", "dropoff": "Oracle"},
+    )
+    assert quote.is_error is False
+    return quote.structured_content
+
+
+async def _book(client: Client, quote_id: str, fare: str | None = "$12.34") -> Any:
+    return await client.call_tool(
+        "waymo_book_ride",
+        {"quote_id": quote_id, "expected_fare": fare, "confirmation": "BOOK"},
+    )
+
+
 @pytest.mark.asyncio
-async def test_quote_then_book_uses_server_issued_token(
+async def test_quote_then_book_uses_server_issued_quote_id(
     fake_waymo: FakeWaymoClient,
 ) -> None:
     async with Client(server.mcp, raise_exceptions=True) as client:
-        quote = await client.call_tool(
-            "waymo_get_quote",
-            {"pickup": "SFO", "dropoff": "Oracle"},
-        )
-        assert quote.is_error is False
-        booked = await client.call_tool(
-            "waymo_book_ride",
-            {
-                "proposal_token": "proposal-1",
-                "payment_method_id": "card-1",
-                "confirmation": "BOOK",
-            },
-        )
+        quote = await _quote(client)
+        assert "proposal_token" not in quote
+        booked = await _book(client, quote["quote_id"])
     assert booked.is_error is False
     assert fake_waymo.book_calls == [("proposal-1", "card-1")]
+
+
+@pytest.mark.asyncio
+async def test_quote_id_is_single_use(fake_waymo: FakeWaymoClient) -> None:
+    async with Client(server.mcp, raise_exceptions=True) as client:
+        quote = await _quote(client)
+        first = await _book(client, quote["quote_id"])
+        second = await _book(client, quote["quote_id"])
+    assert first.is_error is False
+    assert second.is_error is True
+    assert len(fake_waymo.book_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_booking_rejects_raw_waymo_proposal_token(
+    fake_waymo: FakeWaymoClient,
+) -> None:
+    async with Client(server.mcp, raise_exceptions=True) as client:
+        await _quote(client)
+        result = await _book(client, "proposal-1")
+    assert result.is_error is True
+    assert fake_waymo.book_calls == []
+
+
+@pytest.mark.asyncio
+async def test_booking_rejects_fare_mismatch(fake_waymo: FakeWaymoClient) -> None:
+    async with Client(server.mcp, raise_exceptions=True) as client:
+        quote = await _quote(client)
+        result = await _book(client, quote["quote_id"], "$1.00")
+        retry = await _book(client, quote["quote_id"])
+    assert result.is_error is True
+    assert retry.is_error is True  # a failed attempt still burns the quote
+    assert fake_waymo.book_calls == []
+
+
+@pytest.mark.asyncio
+async def test_booking_rejects_expired_quote(
+    fake_waymo: FakeWaymoClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with Client(server.mcp, raise_exceptions=True) as client:
+        quote = await _quote(client)
+        created_at, record = server._quotes[quote["quote_id"]]
+        server._quotes[quote["quote_id"]] = (
+            created_at - server.QUOTE_TTL_SECONDS - 1,
+            record,
+        )
+        result = await _book(client, quote["quote_id"])
+    assert result.is_error is True
+    assert fake_waymo.book_calls == []
+
+
+@pytest.mark.asyncio
+async def test_booking_requires_literal_confirmation(
+    fake_waymo: FakeWaymoClient,
+) -> None:
+    async with Client(server.mcp, raise_exceptions=True) as client:
+        quote = await _quote(client)
+        result = await client.call_tool(
+            "waymo_book_ride",
+            {
+                "quote_id": quote["quote_id"],
+                "expected_fare": "$12.34",
+                "confirmation": "yes",
+            },
+        )
+    assert result.is_error is True
+    assert fake_waymo.book_calls == []
 
 
 @pytest.mark.asyncio
@@ -149,7 +223,7 @@ async def test_quote_accepts_ordered_intermediate_stops(
         == "timestamp_1788337500"
     )
     assert quote.structured_content["waymo_expires_at"] is None
-    assert quote.structured_content["mcp_cache_ttl_seconds"] == 600
+    assert quote.structured_content["mcp_cache_ttl_seconds"] == 300
     assert quote.structured_content["mcp_cache_expires_at"]
 
 
@@ -161,8 +235,8 @@ async def test_booking_rejects_unknown_proposal_token(
         result = await client.call_tool(
             "waymo_book_ride",
             {
-                "proposal_token": "not-issued-here",
-                "payment_method_id": "card-1",
+                "quote_id": "not-issued-here",
+                "expected_fare": "$12.34",
                 "confirmation": "BOOK",
             },
         )

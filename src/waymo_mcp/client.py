@@ -111,6 +111,15 @@ class WaymoClient:
 
     @classmethod
     def from_environment(cls) -> WaymoClient:
+        master_token = os.environ.get("WAYMO_MASTER_TOKEN")
+        if master_token:
+            return cls(
+                Credentials.android(
+                    os.environ["WAYMO_EMAIL"],
+                    master_token,
+                    os.environ["WAYMO_ANDROID_ID"],
+                )
+            )
         refresh_token = os.environ.get("WAYMO_REFRESH_TOKEN")
         if refresh_token:
             return cls(

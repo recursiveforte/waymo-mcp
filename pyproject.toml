@@ -21,6 +21,7 @@ classifiers = [
 ]
 dependencies = [
   "blackboxprotobuf>=1.0",
+  "gpsoauth>=3,<4",
   "grpcio>=1.60",
   "mcp>=2,<3",
 ]

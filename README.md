@@ -26,7 +26,8 @@ It gives an agent eight tools:
 
 - Python 3.11+
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/)
-- A Waymo refresh token from your own signed-in account
+- Credentials from your own signed-in account: an iOS refresh token or an
+  Android master token (see below)
 
 The server runs locally over stdio. Your credentials are not sent to a hosted
 third-party MCP service.
@@ -35,11 +36,12 @@ third-party MCP service.
 
 The server checks, in order:
 
-1. `WAYMO_REFRESH_TOKEN` and optional `WAYMO_DEVICE_ID`
-2. `WAYMO_CREDENTIALS_FILE`
-3. `~/.config/waymo/credentials.json`
+1. `WAYMO_MASTER_TOKEN` with `WAYMO_EMAIL` and `WAYMO_ANDROID_ID` (Android route)
+2. `WAYMO_REFRESH_TOKEN` and optional `WAYMO_DEVICE_ID` (iOS route)
+3. `WAYMO_CREDENTIALS_FILE`
+4. `~/.config/waymo/credentials.json`
 
-The default credential file has this shape:
+There are two credential shapes. An **iOS refresh token**:
 
 ```json
 {
@@ -48,9 +50,31 @@ The default credential file has this shape:
 }
 ```
 
-Create it locally with file mode `0600`. Credential acquisition is outside the server itself; this fork ships
-`scripts/capture_credentials.py`, a mitmproxy addon that captures your own
-iOS app's refresh token and device id into a 0600 file. Never commit a capture, token, or credential file.
+Or an **Android master token**, obtained once from the account's web
+`EmbeddedSetup` `oauth_token`:
+
+```json
+{
+  "master_token": "aas_et/...",
+  "email": "you@gmail.com",
+  "android_id": "0123456789abcdef"
+}
+```
+
+Create the file locally with mode `0600`. Credential acquisition is outside the
+server itself.
+
+- iOS: this fork ships `scripts/capture_credentials.py`, a mitmproxy addon that
+  captures your own iOS app's refresh token and device id into a 0600 file.
+- Android: exchange the account's `EmbeddedSetup` web `oauth_token` for a master
+  token with `gpsoauth.exchange_token`. The master token is long-lived; the
+  server re-mints a short-lived `chauffeur/hail` access token from it on demand
+  via Google Play Services OAuth (the Waymo Android app package
+  `com.waymo.carapp` and its signing-cert SHA-1). That lone scope is all Google
+  grants this restricted client, and it is enough: the Waymo gRPC backend
+  accepts the token directly, so no issuetoken step is needed.
+
+Never commit a capture, token, or credential file.
 
 ## 2. Add the MCP server
 

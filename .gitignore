@@ -11,6 +11,7 @@ __pycache__/
 *.pem
 *.key
 credentials.json
+waymo.json
 dist/
 build/
 *.egg-info/
